@@ -1,0 +1,12 @@
+{
+  "name": "chatgpt-proxy",
+  "version": "1.0.0",
+  "description": "OpenAI-compatible proxy for ChatGPT using browser-bridge relay",
+  "main": "src/proxy.js",
+  "scripts": {
+    "start": "node src/proxy.js",
+    "test": "node test/manual.js"
+  },
+  "keywords": ["chatgpt", "proxy", "openai", "api"],
+  "license": "MIT"
+}
