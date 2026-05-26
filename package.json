@@ -1,6 +1,7 @@
 {
   "name": "chatgpt-proxy",
   "version": "1.0.0",
+  "type": "module",
   "description": "OpenAI-compatible proxy for ChatGPT using browser-bridge relay",
   "main": "src/proxy.js",
   "scripts": {

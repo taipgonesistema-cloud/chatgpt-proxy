@@ -1,15 +1,28 @@
-const http = require("http");
-const https = require("https");
-const crypto = require("crypto");
+import http from 'http';
+import https from 'https';
+import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+import { registerFileTools, buildToolSystemPrompt } from './tools/index.js';
+import { parseToolCallsFromContent, StreamingToolParser } from './tools/parser.js';
+import { executeToolCalls, buildToolMessage, buildAssistantToolCallMessage } from './tools/executor.js';
+
+// Register file tools at startup
+registerFileTools();
+
+process.on("uncaughtException", e => console.error("UNCAUGHT:", e));
+process.on("unhandledRejection", e => console.error("UNHANDLED:", e));
 
 const PORT = Number(process.env.PORT || 9225);
 const RELAY = "http://localhost:9223";
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-let requestQueue = Promise.resolve();
 let cachedCookies = null;
 let cachedCookieTime = 0;
 
-let convState = {
+const convState = {
   conversation_id: null,
   parent_message_id: "client-created-root",
   last_assistant_id: null,
@@ -17,28 +30,35 @@ let convState = {
 
 function log(...args) { console.log("[chatgpt-proxy]", ...args); }
 
-function json(res, status, data) {
-  res.writeHead(status, {
-    "Content-Type": "application/json; charset=utf-8",
+function corsHeaders() {
+  return {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
-  });
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS, PUT, DELETE",
+    "Access-Control-Allow-Headers": "*",
+  };
+}
+
+function json(res, status, data) {
+  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", ...corsHeaders() });
   res.end(JSON.stringify(data));
 }
 
 function relay(path) {
+  log("relay GET", path);
   return new Promise((resolve, reject) => {
-    const req = http.request(`${RELAY}${path}`, { method: "GET" }, (res) => {
+    const req = http.request(`${RELAY}${path}`, { method: "GET", timeout: 10000 }, (res) => {
       let data = "";
       res.setEncoding("utf8");
       res.on("data", (c) => { data += c; });
       res.on("end", () => {
+        log("relay response", path, "status:", res.statusCode, "len:", data.length);
         try { resolve(JSON.parse(data)); }
         catch (err) { reject(new Error(`Relay err: ${err.message}\n${data.slice(0,200)}`)); }
       });
+      res.on("error", (err) => { log("relay res error", path, err.message); reject(err); });
     });
-    req.on("error", reject);
+    req.on("error", (err) => { log("relay req error", path, err.message); reject(err); });
+    req.on("timeout", () => { log("relay timeout", path); req.destroy(); reject(new Error(`Relay timeout ${path}`)); });
     req.end();
   });
 }
@@ -138,58 +158,26 @@ function parseSSE(text) {
   return { text: textparts.join(""), conversation_id: convId, assistant_id: assistantId };
 }
 
-function buildToolSystemMessage(tools) {
-  if (!tools || tools.length === 0) return "";
-  const desc = tools.map(t => {
-    const fn = t.function || t;
-    return `- ${fn.name}: ${fn.description || "No description"} (args: ${JSON.stringify(fn.parameters)})`;
-  }).join("\n");
-  return `You have access to these tools:\n${desc}\n\nWhen you need to use a tool, respond ONLY with:\n<tool_call>{"name":"tool_name","arguments":{...args}}</tool_call>\nOtherwise respond normally.`;
-}
-
-const TOOL_START = "<tool_call>";
-const TOOL_END = "</tool_call>";
-
-function parseToolCalls(text) {
-  const calls = [];
-  let remaining = text;
-  const parts = [];
-  while (true) {
-    const si = remaining.indexOf(TOOL_START);
-    if (si === -1) { parts.push(remaining); break; }
-    parts.push(remaining.substring(0, si));
-    const ei = remaining.indexOf(TOOL_END, si + TOOL_START.length);
-    if (ei === -1) { parts.push(remaining.substring(si)); break; }
-    const json = remaining.substring(si + TOOL_START.length, ei).trim();
-    try {
-      const parsed = JSON.parse(json);
-      calls.push({
-        id: "call_" + crypto.randomUUID().replace(/-/g, "").slice(0, 16),
-        type: "function",
-        function: {
-          name: parsed.name || "",
-          arguments: typeof parsed.arguments === "string" ? parsed.arguments : JSON.stringify(parsed.arguments || {}),
-        },
-      });
-    } catch {
-      parts.push(`<tool_call>${json}</tool_call>`);
-    }
-    remaining = remaining.substring(ei + TOOL_END.length);
-  }
-  return { textContent: parts.join("").trim(), toolCalls: calls };
-}
-
 function convertMessages(messages, tools) {
   const out = [];
-  const sysHint = buildToolSystemMessage(tools);
+
+  const sysHint = buildToolSystemPrompt();
+  const clientSysHint = tools && tools.length > 0
+    ? `\n\nThe client tool definitions:\n${tools.map(t => {
+        const fn = t.function || t;
+        return `- ${fn.name}: ${(fn.description || '').slice(0,200)}`;
+      }).join('\n')}`
+    : '';
+
   if (sysHint) {
     out.push({
       id: crypto.randomUUID(),
       author: { role: "system" },
-      content: { content_type: "text", parts: [sysHint] },
+      content: { content_type: "text", parts: [sysHint + clientSysHint] },
       metadata: {},
     });
   }
+
   for (const m of messages) {
     if (m.role === "system") {
       out.push({
@@ -210,7 +198,7 @@ function convertMessages(messages, tools) {
       let text = m.content || "";
       if (m.tool_calls) {
         text += (text ? "\n" : "") + m.tool_calls.map(tc =>
-          `<tool_call>${JSON.stringify({ name: tc.function.name, arguments: tc.function.arguments })}</tool_call>`
+          `<tool_call>${JSON.stringify({ name: tc.function.name, arguments: JSON.parse(tc.function.arguments || '{}') })}</tool_call>`
         ).join("\n");
       }
       out.push({
@@ -245,7 +233,6 @@ async function sendMessage(messages, tools) {
 
   if (deviceId) baseHeaders["oai-device-id"] = deviceId;
 
-  // 1. sentinel
   const sResp = await httpsCall("POST", "/backend-api/sentinel/chat-requirements/prepare", {
     ...baseHeaders,
     "Content-Type": "text/plain;charset=UTF-8",
@@ -257,7 +244,6 @@ async function sendMessage(messages, tools) {
 
   const msgs = convertMessages(messages, tools);
 
-  // 2. conv prepare
   const prepareBody = JSON.stringify({
     action: "next",
     messages: msgs,
@@ -275,7 +261,6 @@ async function sendMessage(messages, tools) {
 
   const conduitToken = JSON.parse(cpResp.text).conduit_token || "";
 
-  // 3. conversation
   const now = Date.now() / 1000;
   const convMsgs = msgs.map(m => ({
     ...m,
@@ -334,14 +319,26 @@ async function sendMessage(messages, tools) {
   }
 
   const text = result.text || "";
-  if (tools && tools.length > 0) {
-    const parsed = parseToolCalls(text);
-    if (parsed.toolCalls.length > 0) {
-      return { type: "tool_calls", tool_calls: parsed.toolCalls, text: parsed.textContent };
-    }
+
+  const parsed = parseToolCallsFromContent(text);
+  if (parsed.toolCalls.length > 0) {
+    return {
+      type: "tool_calls",
+      tool_calls: parsed.toolCalls.map(tc => ({
+        id: tc.id,
+        type: "function",
+        function: { name: tc.name, arguments: JSON.stringify(tc.arguments) },
+      })),
+      text: parsed.textContent,
+    };
   }
 
   return { type: "text", text };
+}
+
+// Strip <tool_call>...</tool_call> from text for clean client display
+function stripToolCalls(text) {
+  return text.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '');
 }
 
 function sendSSEChunk(res, id, created, delta, finishReason) {
@@ -352,31 +349,81 @@ function sendSSEChunk(res, id, created, delta, finishReason) {
   res.write(`data: ${JSON.stringify(chunk)}\n\n`);
 }
 
+function looksLikeToolRequest(messages) {
+  const lastUser = [...messages].reverse().find(m => m.role === "user")?.content || "";
+  return /cria|criar|create|write|escrev|edita|edit|delete|remove|pasta|folder|file|arquivo|roda|run|command|mkdir|leia|read|lista|list|dir/i.test(String(lastUser));
+}
+
+// ===== HTTP SERVER =====
 
 http.createServer((req, res) => {
-  if (req.method === "OPTIONS") return res.writeHead(204, { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type, Authorization" }), res.end();
+  if (req.method === "GET" && req.url === "/") {
+    const filePath = path.join(__dirname, "..", "..", "index.html");
+    if (fs.existsSync(filePath)) {
+      const content = fs.readFileSync(filePath, "utf8");
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(content);
+    }
+    return res.writeHead(404), res.end("index.html not found");
+  }
+
+  if (req.method === "OPTIONS") return res.writeHead(204, {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS, PUT, DELETE",
+    "Access-Control-Allow-Headers": "*",
+    "Access-Control-Max-Age": "86400",
+  }), res.end();
 
   if (req.method === "POST" && req.url === "/v1/chat/completions") {
+    log("INCOMING from:", req.socket.remoteAddress || "unknown");
     let body = "";
     req.on("data", c => { body += c; });
-    req.on("end", () => {
+    req.on("end", async () => {
+      log("req body len:", body.length);
       try {
         const p = JSON.parse(body);
-        requestQueue = requestQueue.then(async () => {
-          try {
-            if (p.stream) {
-              await handleStream(p, res);
-              return;
+        if (p.messages && p.messages.length > 10) {
+          p.messages = p.messages.filter(m => m.role === "system").concat(p.messages.filter(m => m.role !== "system").slice(-10));
+        }
+        try {
+          if (p.stream) {
+            log("starting stream handler");
+            await handleStreamWithTimeout(p, res);
+            log("stream handler done");
+            return;
+          }
+
+          log("calling sendMessage");
+          const result = await sendMessage(p.messages || [], p.tools);
+
+          if (result.type === "tool_calls") {
+            log("tool calls detected, running server-side execution");
+            const toolCalls = result.tool_calls.map(tc => ({
+              id: tc.id,
+              name: tc.function.name,
+              arguments: typeof tc.function.arguments === 'string'
+                ? JSON.parse(tc.function.arguments)
+                : tc.function.arguments,
+            }));
+
+            const context = { messages: p.messages, turn: 0, model: p.model };
+            const toolResults = await executeToolCalls(toolCalls, context);
+
+            const msgs = [...p.messages];
+            msgs.push({ role: "assistant", content: result.text || null, tool_calls: result.tool_calls });
+            for (const tr of toolResults) {
+              msgs.push(buildToolMessage(tr));
             }
 
-            const result = await sendMessage(p.messages || [], p.tools);
-            if (result.type === "tool_calls") {
+            const nextResult = await sendMessage(msgs, p.tools);
+
+            if (nextResult.type === "tool_calls") {
               json(res, 200, {
                 id: `chatcmpl-${Date.now()}`,
                 object: "chat.completion",
                 created: Math.floor(Date.now() / 1000),
                 model: "chatgpt-web",
-                choices: [{ index: 0, message: { role: "assistant", content: null, tool_calls: result.tool_calls }, finish_reason: "tool_calls" }],
+                choices: [{ index: 0, message: { role: "assistant", content: null, tool_calls: nextResult.tool_calls }, finish_reason: "tool_calls" }],
                 usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
               });
             } else {
@@ -385,15 +432,24 @@ http.createServer((req, res) => {
                 object: "chat.completion",
                 created: Math.floor(Date.now() / 1000),
                 model: "chatgpt-web",
-                choices: [{ index: 0, message: { role: "assistant", content: result.text }, finish_reason: "stop" }],
+                choices: [{ index: 0, message: { role: "assistant", content: nextResult.text }, finish_reason: "stop" }],
                 usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
               });
             }
-          } catch (err) {
-            log("ERROR:", err.message);
-            json(res, 500, { error: err.message });
+          } else {
+            json(res, 200, {
+              id: `chatcmpl-${Date.now()}`,
+              object: "chat.completion",
+              created: Math.floor(Date.now() / 1000),
+              model: "chatgpt-web",
+              choices: [{ index: 0, message: { role: "assistant", content: result.text }, finish_reason: "stop" }],
+              usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+            });
           }
-        });
+        } catch (err) {
+          log("ERROR:", err.message);
+          json(res, 500, { error: err.message });
+        }
       } catch (err) {
         json(res, 400, { error: `Invalid JSON: ${err.message}` });
       }
@@ -410,6 +466,8 @@ http.createServer((req, res) => {
   log(`Running on http://localhost:${PORT}`);
 });
 
+// ===== STREAMING WITH SERVER-SIDE TOOL LOOP =====
+
 async function handleStream(p, res) {
   const cookie = await getCookieHeader();
   const deviceId = await getDeviceId();
@@ -425,125 +483,193 @@ async function handleStream(p, res) {
   if (sResp.status !== 200) return json(res, 500, { error: `Sentinel ${sResp.status}` });
   const prepareToken = (JSON.parse(sResp.text).prepare_token || "");
 
-  const msgs = convertMessages(p.messages || [], p.tools);
+  const loopMessages = [...(p.messages || [])];
 
-  const prepareBody = JSON.stringify({
-    action: "next", messages: msgs, parent_message_id: convState.parent_message_id,
-    model: "auto", conversation_mode: { kind: "primary_assistant" },
-    ...(convState.conversation_id ? { conversation_id: convState.conversation_id } : {}),
-  });
-  const cpResp = await httpsCall("POST", "/backend-api/f/conversation/prepare", { ...baseHeaders, "Content-Type": "application/json", "Openai-Sentinel-Chat-Requirements-Token": prepareToken }, prepareBody);
-  if (cpResp.status !== 200) return json(res, 500, { error: `Conv prepare ${cpResp.status}` });
-  const conduitToken = JSON.parse(cpResp.text).conduit_token || "";
-
-  const now = Date.now() / 1000;
-  const convMsgs = msgs.map(m => ({ ...m, create_time: now, metadata: { ...m.metadata, selected_github_repos: [], selected_all_github_repos: false, serialization_metadata: { custom_symbol_offsets: [] } } }));
-  const convBody = JSON.stringify({
-    action: "next", messages: convMsgs, parent_message_id: convState.parent_message_id,
-    model: "auto", client_prepare_state: "success", timezone_offset_min: 180,
-    timezone: "America/Sao_Paulo", conversation_mode: { kind: "primary_assistant" },
-    ...(convState.conversation_id ? { conversation_id: convState.conversation_id } : {}),
-    enable_message_followups: true, system_hints: [], supports_buffering: true,
-    supported_encodings: ["v1"],
-    client_contextual_info: { is_dark_mode: true, time_since_loaded: 21, page_height: 935, page_width: 1920, pixel_ratio: 1, screen_height: 1080, screen_width: 1920, app_name: "chatgpt.com" },
-    paragen_cot_summary_display_override: "allow", force_parallel_switch: "auto",
-  });
+  const id = `chatcmpl-${Date.now()}`;
+  const created = Math.floor(Date.now() / 1000);
+  const shouldForceTool = looksLikeToolRequest(loopMessages);
+  let executedToolCount = 0;
+  let retryWithoutToolCount = 0;
 
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache",
     "Connection": "keep-alive",
-    "Access-Control-Allow-Origin": "*",
+    ...corsHeaders(),
   });
 
-  const id = `chatcmpl-${Date.now()}`;
-  const created = Math.floor(Date.now() / 1000);
-  let sseBuffer = "", lastP = "", lastO = "", roleSent = false, collectedText = "";
+  const maxTurns = 10;
+  for (let turn = 0; turn < maxTurns; turn++) {
+    log(`stream turn ${turn + 1}/${maxTurns}`);
+    const msgs = convertMessages(loopMessages, p.tools);
 
-  const convReq = https.request(new URL("https://chatgpt.com/backend-api/f/conversation"), {
-    method: "POST",
-    headers: { ...baseHeaders, "Openai-Sentinel-Chat-Requirements-Token": prepareToken, "Openai-Sentinel-Conduit-Token": conduitToken },
-  }, (convRes) => {
-    convRes.setEncoding("utf8");
-    convRes.on("data", (chunk) => {
-      sseBuffer += chunk;
+    const prepareBody = JSON.stringify({
+      action: "next", messages: msgs, parent_message_id: convState.parent_message_id,
+      model: "auto", conversation_mode: { kind: "primary_assistant" },
+      ...(convState.conversation_id ? { conversation_id: convState.conversation_id } : {}),
+    });
+    const cpResp = await httpsCall("POST", "/backend-api/f/conversation/prepare", { ...baseHeaders, "Content-Type": "application/json", "Openai-Sentinel-Chat-Requirements-Token": prepareToken }, prepareBody);
+    if (cpResp.status !== 200) {
+      if (turn === 0) return json(res, 500, { error: `Conv prepare ${cpResp.status}` });
+      break;
+    }
+    const conduitToken = JSON.parse(cpResp.text).conduit_token || "";
 
-      // Extract all data payloads via regex, split by \n\n event boundaries
-      const parts = sseBuffer.split(/\n\n/);
-      sseBuffer = parts.pop() || ""; // keep incomplete trailing part
+    const nowTs = Date.now() / 1000;
+    const convMsgs = msgs.map(m => ({ ...m, create_time: nowTs, metadata: { ...m.metadata, selected_github_repos: [], selected_all_github_repos: false, serialization_metadata: { custom_symbol_offsets: [] } } }));
+    const convBody = JSON.stringify({
+      action: "next", messages: convMsgs, parent_message_id: convState.parent_message_id,
+      model: "auto", client_prepare_state: "success", timezone_offset_min: 180,
+      timezone: "America/Sao_Paulo", conversation_mode: { kind: "primary_assistant" },
+      ...(convState.conversation_id ? { conversation_id: convState.conversation_id } : {}),
+      enable_message_followups: true, system_hints: [], supports_buffering: true,
+      supported_encodings: ["v1"],
+      client_contextual_info: { is_dark_mode: true, time_since_loaded: 21, page_height: 935, page_width: 1920, pixel_ratio: 1, screen_height: 1080, screen_width: 1920, app_name: "chatgpt.com" },
+      paragen_cot_summary_display_override: "allow", force_parallel_switch: "auto",
+    });
 
-      for (const part of parts) {
-        const dataMatch = part.match(/^data: (.+)/m);
-        if (!dataMatch) continue;
-        const payload = dataMatch[1];
-        if (payload === "[DONE]") continue;
+    let sseBuffer = "", lastP = "", lastO = "", roleSentInTurn = false, collectedText = "";
+    const toolStreamParser = new StreamingToolParser();
 
-        try {
-          const obj = JSON.parse(payload);
-          if (typeof obj !== "object") continue;
+    const emitCleanText = (clean) => {
+      if (!clean) return;
+      if (!roleSentInTurn) {
+        sendSSEChunk(res, id, created, { role: "assistant", content: clean }, null);
+        roleSentInTurn = true;
+      } else {
+        sendSSEChunk(res, id, created, { content: clean }, null);
+      }
+    };
 
-          if (obj.type === "resume_conversation_token" && obj.conversation_id) {
-            convState.conversation_id = obj.conversation_id;
-          }
-          if (obj.v?.message?.author?.role === "assistant" && obj.v?.message?.id) {
-            convState.parent_message_id = obj.v.message.id;
-            convState.last_assistant_id = obj.v.message.id;
-          }
+    await new Promise((resolve, reject) => {
+      const convReq = https.request(new URL("https://chatgpt.com/backend-api/f/conversation"), {
+        method: "POST",
+        headers: { ...baseHeaders, "Openai-Sentinel-Chat-Requirements-Token": prepareToken, "Openai-Sentinel-Conduit-Token": conduitToken },
+      }, (convRes) => {
+        convRes.setEncoding("utf8");
+        convRes.on("data", (chunk) => {
+          sseBuffer += chunk;
+          const parts = sseBuffer.split(/\n\n/);
+          sseBuffer = parts.pop() || "";
 
-          const curP = obj.p !== undefined ? obj.p : lastP;
-          const curO = obj.o !== undefined ? obj.o : lastO;
-          lastP = curP; lastO = curO;
+          for (const part of parts) {
+            const dataMatch = part.match(/^data: (.+)/m);
+            if (!dataMatch) continue;
+            const payload = dataMatch[1];
+            if (payload === "[DONE]") continue;
 
-          if (curP === "/message/content/parts/0" && curO === "append") {
-            const t = obj.v || "";
-            if (t) {
-              collectedText += t;
-              if (!roleSent) {
-                sendSSEChunk(res, id, created, { role: "assistant", content: t }, null);
-                roleSent = true;
-              } else {
-                sendSSEChunk(res, id, created, { content: t }, null);
+            try {
+              const obj = JSON.parse(payload);
+              if (typeof obj !== "object") continue;
+
+              if (obj.type === "resume_conversation_token" && obj.conversation_id) {
+                convState.conversation_id = obj.conversation_id;
               }
-            }
-          }
+              if (obj.v?.message?.author?.role === "assistant" && obj.v?.message?.id) {
+                convState.parent_message_id = obj.v.message.id;
+                convState.last_assistant_id = obj.v.message.id;
+              }
 
-          if (curO === "patch" && Array.isArray(obj.v)) {
-            for (const op of obj.v) {
-              if (op.p === "/message/content/parts/0" && op.o === "append") {
-                const t = op.v || "";
-                if (t) {
-                  collectedText += t;
-                  if (!roleSent) {
-                    sendSSEChunk(res, id, created, { role: "assistant", content: t }, null);
-                    roleSent = true;
-                  } else {
-                    sendSSEChunk(res, id, created, { content: t }, null);
+              const curP = obj.p !== undefined ? obj.p : lastP;
+              const curO = obj.o !== undefined ? obj.o : lastO;
+              lastP = curP; lastO = curO;
+
+              // Helper to stream a clean text chunk (tool calls stripped)
+              const streamText = (t) => {
+                collectedText += t;
+                const parsedChunk = toolStreamParser.feed(t);
+                emitCleanText(parsedChunk.text);
+              };
+
+              if (curP === "/message/content/parts/0" && curO === "append") {
+                const t = obj.v || "";
+                if (t) streamText(t);
+              }
+
+              if (curO === "patch" && Array.isArray(obj.v)) {
+                for (const op of obj.v) {
+                  if (op.p === "/message/content/parts/0" && op.o === "append") {
+                    const t = op.v || "";
+                    if (t) streamText(t);
                   }
                 }
               }
-            }
+            } catch {}
           }
-        } catch {}
-      }
+        });
+        convRes.on("end", () => {
+          const finalChunk = toolStreamParser.flush();
+          emitCleanText(finalChunk.text);
+          if (!roleSentInTurn && !collectedText) {
+            sendSSEChunk(res, id, created, { role: "assistant", content: "" }, null);
+          }
+          resolve();
+        });
+        convRes.on("error", reject);
+      });
+      convReq.on("error", reject);
+      convReq.write(convBody);
+      convReq.end();
     });
-    convRes.on("end", () => {
-      if (p.tools && p.tools.length > 0) {
-        const parsed = parseToolCalls(collectedText);
-        if (parsed.toolCalls.length > 0) {
-          if (!roleSent) sendSSEChunk(res, id, created, { role: "assistant", content: null }, null);
-          sendSSEChunk(res, id, created, {}, "tool_calls");
-          res.write("data: [DONE]\n\n");
-          res.end();
-          return;
-        }
+
+    // Parse for tool calls
+    const parsed = parseToolCallsFromContent(collectedText);
+
+    if (parsed.toolCalls.length === 0) {
+      if (shouldForceTool && executedToolCount === 0 && retryWithoutToolCount < 2) {
+        retryWithoutToolCount++;
+        loopMessages.push({ role: "assistant", content: collectedText || "" });
+        loopMessages.push({
+          role: "user",
+          content: "You did not call a tool. The requested operation will not happen unless you call a tool. Respond ONLY with the correct <tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call> now.",
+        });
+        log(`turn ${turn + 1}: no tool call for tool request, retrying (${retryWithoutToolCount}/2)`);
+        continue;
       }
-      if (!roleSent) sendSSEChunk(res, id, created, { role: "assistant", content: "" }, null);
       sendSSEChunk(res, id, created, {}, "stop");
       res.write("data: [DONE]\n\n");
       res.end();
-    });
-  });
-  convReq.on("error", (err) => { json(res, 500, { error: err.message }); });
-  convReq.write(convBody);
-  convReq.end();
+      return;
+    }
+
+    log(`turn ${turn + 1}: ${parsed.toolCalls.length} tool calls, executing server-side...`);
+
+    const toolCallsForMsg = parsed.toolCalls.map(tc => ({
+      id: tc.id,
+      type: "function",
+      function: { name: tc.name, arguments: JSON.stringify(tc.arguments) },
+    }));
+
+    loopMessages.push({ role: "assistant", content: parsed.textContent || null, tool_calls: toolCallsForMsg });
+
+    const context = { messages: loopMessages, turn, model: "chatgpt-web" };
+    const toolResults = await executeToolCalls(parsed.toolCalls, context);
+    executedToolCount += parsed.toolCalls.length;
+
+    for (const tr of toolResults) {
+      loopMessages.push(buildToolMessage(tr));
+    }
+
+    log(`turn ${turn + 1}: tools executed (${toolResults.filter(r => r.isError).length} errors)`);
+
+    if (turn >= maxTurns - 1) {
+      sendSSEChunk(res, id, created, {}, "tool_calls");
+      res.write("data: [DONE]\n\n");
+      res.end();
+      return;
+    }
+  }
+
+  sendSSEChunk(res, id, created, {}, "stop");
+  res.write("data: [DONE]\n\n");
+  res.end();
+}
+
+async function handleStreamWithTimeout(p, res) {
+  const timer = setTimeout(() => {
+    log("STREAM TIMEOUT");
+    try { res.write("data: [DONE]\n\n"); res.end(); } catch {}
+  }, 120000);
+  try { await handleStream(p, res); }
+  finally { clearTimeout(timer); }
 }
