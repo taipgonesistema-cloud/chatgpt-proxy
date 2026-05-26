@@ -344,15 +344,6 @@ async function sendMessage(messages, tools) {
   return { type: "text", text };
 }
 
-function sendSSEChunk(res, id, created, delta, finishReason) {
-  const chunk = {
-    id, object: "chat.completion.chunk", created, model: "chatgpt-web",
-    choices: [{ index: 0, delta, finish_reason: finishReason || null }],
-  };
-  res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-}
-
-
 http.createServer((req, res) => {
   if (req.method === "OPTIONS") return res.writeHead(204, { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type, Authorization" }), res.end();
 
@@ -362,13 +353,9 @@ http.createServer((req, res) => {
     req.on("end", () => {
       try {
         const p = JSON.parse(body);
+        if (p.stream) return json(res, 400, { error: "Streaming not yet supported" });
         requestQueue = requestQueue.then(async () => {
           try {
-            if (p.stream) {
-              await handleStream(p, res);
-              return;
-            }
-
             const result = await sendMessage(p.messages || [], p.tools);
             if (result.type === "tool_calls") {
               json(res, 200, {
@@ -409,141 +396,3 @@ http.createServer((req, res) => {
 }).listen(PORT, () => {
   log(`Running on http://localhost:${PORT}`);
 });
-
-async function handleStream(p, res) {
-  const cookie = await getCookieHeader();
-  const deviceId = await getDeviceId();
-  const baseHeaders = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148 Safari/537.36",
-    "Origin": "https://chatgpt.com",
-    "Referer": "https://chatgpt.com/",
-    "Cookie": cookie,
-  };
-  if (deviceId) baseHeaders["oai-device-id"] = deviceId;
-
-  const sResp = await httpsCall("POST", "/backend-api/sentinel/chat-requirements/prepare", { ...baseHeaders, "Content-Type": "text/plain;charset=UTF-8" }, "{}");
-  if (sResp.status !== 200) return json(res, 500, { error: `Sentinel ${sResp.status}` });
-  const prepareToken = (JSON.parse(sResp.text).prepare_token || "");
-
-  const msgs = convertMessages(p.messages || [], p.tools);
-
-  const prepareBody = JSON.stringify({
-    action: "next", messages: msgs, parent_message_id: convState.parent_message_id,
-    model: "auto", conversation_mode: { kind: "primary_assistant" },
-    ...(convState.conversation_id ? { conversation_id: convState.conversation_id } : {}),
-  });
-  const cpResp = await httpsCall("POST", "/backend-api/f/conversation/prepare", { ...baseHeaders, "Content-Type": "application/json", "Openai-Sentinel-Chat-Requirements-Token": prepareToken }, prepareBody);
-  if (cpResp.status !== 200) return json(res, 500, { error: `Conv prepare ${cpResp.status}` });
-  const conduitToken = JSON.parse(cpResp.text).conduit_token || "";
-
-  const now = Date.now() / 1000;
-  const convMsgs = msgs.map(m => ({ ...m, create_time: now, metadata: { ...m.metadata, selected_github_repos: [], selected_all_github_repos: false, serialization_metadata: { custom_symbol_offsets: [] } } }));
-  const convBody = JSON.stringify({
-    action: "next", messages: convMsgs, parent_message_id: convState.parent_message_id,
-    model: "auto", client_prepare_state: "success", timezone_offset_min: 180,
-    timezone: "America/Sao_Paulo", conversation_mode: { kind: "primary_assistant" },
-    ...(convState.conversation_id ? { conversation_id: convState.conversation_id } : {}),
-    enable_message_followups: true, system_hints: [], supports_buffering: true,
-    supported_encodings: ["v1"],
-    client_contextual_info: { is_dark_mode: true, time_since_loaded: 21, page_height: 935, page_width: 1920, pixel_ratio: 1, screen_height: 1080, screen_width: 1920, app_name: "chatgpt.com" },
-    paragen_cot_summary_display_override: "allow", force_parallel_switch: "auto",
-  });
-
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-cache",
-    "Connection": "keep-alive",
-    "Access-Control-Allow-Origin": "*",
-  });
-
-  const id = `chatcmpl-${Date.now()}`;
-  const created = Math.floor(Date.now() / 1000);
-  let sseBuffer = "", lastP = "", lastO = "", roleSent = false, collectedText = "";
-
-  const convReq = https.request(new URL("https://chatgpt.com/backend-api/f/conversation"), {
-    method: "POST",
-    headers: { ...baseHeaders, "Openai-Sentinel-Chat-Requirements-Token": prepareToken, "Openai-Sentinel-Conduit-Token": conduitToken },
-  }, (convRes) => {
-    convRes.setEncoding("utf8");
-    convRes.on("data", (chunk) => {
-      sseBuffer += chunk;
-
-      // Extract all data payloads via regex, split by \n\n event boundaries
-      const parts = sseBuffer.split(/\n\n/);
-      sseBuffer = parts.pop() || ""; // keep incomplete trailing part
-
-      for (const part of parts) {
-        const dataMatch = part.match(/^data: (.+)/m);
-        if (!dataMatch) continue;
-        const payload = dataMatch[1];
-        if (payload === "[DONE]") continue;
-
-        try {
-          const obj = JSON.parse(payload);
-          if (typeof obj !== "object") continue;
-
-          if (obj.type === "resume_conversation_token" && obj.conversation_id) {
-            convState.conversation_id = obj.conversation_id;
-          }
-          if (obj.v?.message?.author?.role === "assistant" && obj.v?.message?.id) {
-            convState.parent_message_id = obj.v.message.id;
-            convState.last_assistant_id = obj.v.message.id;
-          }
-
-          const curP = obj.p !== undefined ? obj.p : lastP;
-          const curO = obj.o !== undefined ? obj.o : lastO;
-          lastP = curP; lastO = curO;
-
-          if (curP === "/message/content/parts/0" && curO === "append") {
-            const t = obj.v || "";
-            if (t) {
-              collectedText += t;
-              if (!roleSent) {
-                sendSSEChunk(res, id, created, { role: "assistant", content: t }, null);
-                roleSent = true;
-              } else {
-                sendSSEChunk(res, id, created, { content: t }, null);
-              }
-            }
-          }
-
-          if (curO === "patch" && Array.isArray(obj.v)) {
-            for (const op of obj.v) {
-              if (op.p === "/message/content/parts/0" && op.o === "append") {
-                const t = op.v || "";
-                if (t) {
-                  collectedText += t;
-                  if (!roleSent) {
-                    sendSSEChunk(res, id, created, { role: "assistant", content: t }, null);
-                    roleSent = true;
-                  } else {
-                    sendSSEChunk(res, id, created, { content: t }, null);
-                  }
-                }
-              }
-            }
-          }
-        } catch {}
-      }
-    });
-    convRes.on("end", () => {
-      if (p.tools && p.tools.length > 0) {
-        const parsed = parseToolCalls(collectedText);
-        if (parsed.toolCalls.length > 0) {
-          if (!roleSent) sendSSEChunk(res, id, created, { role: "assistant", content: null }, null);
-          sendSSEChunk(res, id, created, {}, "tool_calls");
-          res.write("data: [DONE]\n\n");
-          res.end();
-          return;
-        }
-      }
-      if (!roleSent) sendSSEChunk(res, id, created, { role: "assistant", content: "" }, null);
-      sendSSEChunk(res, id, created, {}, "stop");
-      res.write("data: [DONE]\n\n");
-      res.end();
-    });
-  });
-  convReq.on("error", (err) => { json(res, 500, { error: err.message }); });
-  convReq.write(convBody);
-  convReq.end();
-}
