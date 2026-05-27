@@ -1,675 +1,502 @@
-import http from 'http';
-import https from 'https';
-import crypto from 'crypto';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-
-import { registerFileTools, buildToolSystemPrompt } from './tools/index.js';
-import { parseToolCallsFromContent, StreamingToolParser } from './tools/parser.js';
-import { executeToolCalls, buildToolMessage, buildAssistantToolCallMessage } from './tools/executor.js';
-
-// Register file tools at startup
-registerFileTools();
-
-process.on("uncaughtException", e => console.error("UNCAUGHT:", e));
-process.on("unhandledRejection", e => console.error("UNHANDLED:", e));
+import http from "node:http";
+import crypto from "node:crypto";
+import fs from "node:fs";
 
 const PORT = Number(process.env.PORT || 9225);
 const RELAY = "http://localhost:9223";
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const UI_PATH = "C:\\Users\\Desktop\\Desktop\\yk\\index.html";
+const PI_AGENT_CONTRACT = [
+  "You are a precise, pragmatic software engineering agent running inside Pi Coding Agent.",
+  "Your priorities are correctness, evidence, minimal safe changes, and clear concise communication.",
+  "Do not guess about files, APIs, commands, package scripts, config, errors, or project structure. Inspect with tools first.",
+  "Before answering questions about the current workspace, use read/list/search tools unless the answer is already present in the conversation.",
+  "Before editing code, inspect the relevant files and understand the existing style. Make the smallest correct change.",
+  "Never claim you changed, tested, installed, ran, or verified something unless a tool result proves it.",
+  "If a command fails, use the error output to diagnose and continue with a smaller next step when safe.",
+  "Do not overwrite or revert user work unless explicitly asked. Treat unexpected file changes as user-owned.",
+  "Avoid broad refactors, new abstractions, and compatibility layers unless the user asks or the existing code clearly requires them.",
+  "Prefer concrete file paths, command names, and observed outputs over general explanations.",
+  "When implementation is requested, act instead of only proposing. When the user asks a question, answer directly after gathering enough evidence.",
+  "For code review, prioritize bugs, regressions, missing tests, and risks before summaries.",
+  "For frontend work, preserve the existing design system unless the user asks for redesign.",
+  "Security: do not expose secrets, tokens, cookies, private keys, or credential files. Do not print sensitive file contents unless explicitly required and safe.",
+  "Use Portuguese when the user writes Portuguese. Keep final answers concise and factual.",
+].join("\n");
+const PI_TOOL_CONTRACT = [
+  "You are running inside Pi Coding Agent through an OpenAI-compatible proxy.",
+  "Pi can execute tools for you, but only if your response is valid structured tool-call text.",
+  "When a tool is needed, output only tool calls and nothing else.",
+  "Use exactly this form, with valid JSON inside:",
+  '<tool_call>{"name":"tool_name","arguments":{"arg":"value"}}</tool_call>',
+  "Never put tool calls in Markdown code fences.",
+  "Never explain a tool call before or after emitting it.",
+  "The arguments object must match the selected tool schema exactly.",
+  "For bash, command and timeout are separate fields, for example:",
+  '<tool_call>{"name":"bash","arguments":{"command":"dir","timeout":10}}</tool_call>',
+  "Do not produce malformed JSON like {\"command\":\"timeout\":10}.",
+  "After Pi returns tool results in later messages, use those results to answer concisely.",
+  "Use Portuguese when the user writes Portuguese, unless the task requires code or exact command output.",
+].join("\n");
 
-let cachedCookies = null;
-let cachedCookieTime = 0;
-
-const convState = {
-  conversation_id: null,
-  parent_message_id: "client-created-root",
-  last_assistant_id: null,
-};
+let requestQueue = Promise.resolve();
+let tabId = null;
 
 function log(...args) { console.log("[chatgpt-proxy]", ...args); }
 
-function corsHeaders() {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS, PUT, DELETE",
-    "Access-Control-Allow-Headers": "*",
-  };
-}
-
 function json(res, status, data) {
-  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", ...corsHeaders() });
+  res.writeHead(status, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  });
   res.end(JSON.stringify(data));
 }
 
-function relay(path) {
-  log("relay GET", path);
+function relay(path, body = null, timeoutMs = 60000, contentType = "text/plain;charset=UTF-8") {
   return new Promise((resolve, reject) => {
-    const req = http.request(`${RELAY}${path}`, { method: "GET", timeout: 10000 }, (res) => {
+    const url = new URL(RELAY + path);
+    const opts = {
+      method: body === null ? "GET" : "POST",
+      hostname: url.hostname,
+      port: url.port,
+      path: url.pathname + url.search,
+      timeout: timeoutMs,
+    };
+    if (body !== null) opts.headers = { "Content-Type": contentType, "Content-Length": Buffer.byteLength(body) };
+    const req = http.request(opts, (res) => {
       let data = "";
       res.setEncoding("utf8");
-      res.on("data", (c) => { data += c; });
+      res.on("data", (c) => data += c);
       res.on("end", () => {
-        log("relay response", path, "status:", res.statusCode, "len:", data.length);
         try { resolve(JSON.parse(data)); }
-        catch (err) { reject(new Error(`Relay err: ${err.message}\n${data.slice(0,200)}`)); }
+        catch (err) { reject(new Error(`Relay parse: ${err.message}: ${data.slice(0, 200)}`)); }
       });
-      res.on("error", (err) => { log("relay res error", path, err.message); reject(err); });
-    });
-    req.on("error", (err) => { log("relay req error", path, err.message); reject(err); });
-    req.on("timeout", () => { log("relay timeout", path); req.destroy(); reject(new Error(`Relay timeout ${path}`)); });
-    req.end();
-  });
-}
-
-async function getCookieHeader() {
-  if (cachedCookies && Date.now() - cachedCookieTime < 30000) return cachedCookies;
-  const r = await relay("/cookies");
-  const cookies = r?.result?.cookies || [];
-  const domains = [".chatgpt.com", "chatgpt.com", ".auth.openai.com", "auth.openai.com"];
-  const relevant = cookies.filter(c => domains.includes(c.domain));
-  const header = relevant.map(c => `${c.name}=${c.value}`).join("; ");
-  cachedCookies = header;
-  cachedCookieTime = Date.now();
-  return header;
-}
-
-async function getDeviceId() {
-  const r = await relay("/cookies");
-  const cookies = r?.result?.cookies || [];
-  const did = cookies.find(c => c.name === "oai-did" && c.domain.includes("chatgpt"));
-  return did ? did.value : "";
-}
-
-function httpsCall(method, path, headers, body, maxTime = 120000) {
-  return new Promise((resolve, reject) => {
-    const url = new URL(`https://chatgpt.com${path}`);
-    if (body && !headers["Content-Type"]) {
-      headers["Content-Type"] = "text/plain;charset=UTF-8";
-    }
-    const opts = { method, hostname: url.hostname, path: url.pathname, headers };
-    const req = https.request(opts, (res) => {
-      let data = "";
-      res.setEncoding("utf8");
-      const contentType = res.headers["content-type"] || "";
-      if (contentType.includes("event-stream")) {
-        let buffer = "";
-        const timer = setTimeout(() => { res.destroy(); }, maxTime);
-        res.on("data", chunk => {
-          buffer += chunk;
-          if (buffer.includes("[DONE]") || buffer.includes("message_stream_complete")) {
-            clearTimeout(timer);
-            res.destroy();
-            resolve({ status: res.statusCode, headers: res.headers, text: buffer });
-          }
-        });
-        res.on("close", () => {
-          clearTimeout(timer);
-          resolve({ status: res.statusCode, headers: res.headers, text: buffer });
-        });
-      } else {
-        const timer = setTimeout(() => { req.destroy(); reject(new Error("Timeout")); }, maxTime);
-        res.on("data", c => { data += c; });
-        res.on("end", () => { clearTimeout(timer); resolve({ status: res.statusCode, headers: res.headers, text: data }); });
-      }
     });
     req.on("error", reject);
-    if (body) req.write(body);
+    req.on("timeout", () => { req.destroy(); reject(new Error("Relay timeout")); });
+    if (body !== null) req.write(body);
     req.end();
   });
 }
 
-function parseSSE(text) {
-  let textparts = [];
-  let convId = null;
-  let assistantId = null;
-  let lastP = "";
-  let lastO = "";
-  for (const line of text.split("\n")) {
-    if (line.startsWith("data: ")) {
-      const p = line.slice(6);
-      if (p === "[DONE]") continue;
-      try {
-        const obj = JSON.parse(p);
-        if (obj.type === "resume_conversation_token" && obj.conversation_id) {
-          convId = obj.conversation_id;
-        }
-        const curP = obj.p !== undefined ? obj.p : lastP;
-        const curO = obj.o !== undefined ? obj.o : lastO;
-        lastP = curP;
-        lastO = curO;
-        if (curP === "/message/content/parts/0" && curO === "append") {
-          textparts.push(obj.v || "");
-        }
-        if (curO === "patch" && Array.isArray(obj.v)) {
-          for (const op of obj.v) {
-            if (op.p === "/message/content/parts/0" && op.o === "append") {
-              textparts.push(op.v || "");
-            }
-          }
-        }
-        if (obj.v?.message?.author?.role === "assistant" && obj.v?.message?.id) {
-          if (!assistantId) assistantId = obj.v.message.id;
-        }
-      } catch {}
-    }
-  }
-  return { text: textparts.join(""), conversation_id: convId, assistant_id: assistantId };
+async function getChatGptTabId() {
+  if (tabId) return tabId;
+  const r = await relay("/tabs", null, 10000);
+  const tabs = r?.result || [];
+  const tab = tabs.find((t) => t.url?.startsWith("https://chatgpt.com"));
+  if (!tab) throw new Error("No ChatGPT tab found");
+  tabId = tab.id;
+  return tab.id;
 }
 
-function convertMessages(messages, tools) {
-  const out = [];
+async function evalInTab(code, timeoutMs = 30000) {
+  const id = await getChatGptTabId();
+  const r = await relay(`/evalAsync?tabId=${id}&timeout=${timeoutMs}`, code, timeoutMs + 5000);
+  if (!r.result?.ok) throw new Error(r.result?.error || "eval failed");
+  return r.result.result;
+}
 
-  const sysHint = buildToolSystemPrompt();
-  const clientSysHint = tools && tools.length > 0
-    ? `\n\nThe client tool definitions:\n${tools.map(t => {
-        const fn = t.function || t;
-        return `- ${fn.name}: ${(fn.description || '').slice(0,200)}`;
-      }).join('\n')}`
-    : '';
+function lastUserText(messages) {
+  const last = [...(messages || [])].reverse().find((m) => m.role === "user");
+  if (!last) return "";
+  if (typeof last.content === "string") return last.content;
+  if (Array.isArray(last.content)) {
+    return last.content.map((p) => typeof p === "string" ? p : p?.text || "").filter(Boolean).join("\n");
+  }
+  return String(last.content || "");
+}
 
-  if (sysHint) {
-    out.push({
-      id: crypto.randomUUID(),
-      author: { role: "system" },
-      content: { content_type: "text", parts: [sysHint + clientSysHint] },
-      metadata: {},
-    });
+function messageContent(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((part) => {
+      if (typeof part === "string") return part;
+      if (part?.type === "text") return part.text || "";
+      return part?.text || JSON.stringify(part);
+    }).filter(Boolean).join("\n");
+  }
+  return content == null ? "" : String(content);
+}
+
+function buildPrompt(params) {
+  const messages = Array.isArray(params.messages) ? params.messages : [];
+  const tools = Array.isArray(params.tools) ? params.tools : [];
+  const parts = [PI_AGENT_CONTRACT];
+
+  if (tools.length > 0) {
+    parts.push([
+      PI_TOOL_CONTRACT,
+      "Available tools:",
+      JSON.stringify(tools, null, 2),
+    ].join("\n"));
   }
 
-  for (const m of messages) {
-    if (m.role === "system") {
-      out.push({
-        id: crypto.randomUUID(),
-        author: { role: "system" },
-        content: { content_type: "text", parts: [m.content] },
-        metadata: {},
-      });
-    } else if (m.role === "user") {
-      const parts = typeof m.content === "string" ? [m.content] : (m.content || []);
-      out.push({
-        id: crypto.randomUUID(),
-        author: { role: "user" },
-        content: { content_type: "text", parts },
-        metadata: {},
-      });
-    } else if (m.role === "assistant") {
-      let text = m.content || "";
-      if (m.tool_calls) {
-        text += (text ? "\n" : "") + m.tool_calls.map(tc =>
-          `<tool_call>${JSON.stringify({ name: tc.function.name, arguments: JSON.parse(tc.function.arguments || '{}') })}</tool_call>`
-        ).join("\n");
-      }
-      out.push({
-        id: crypto.randomUUID(),
-        author: { role: "assistant" },
-        content: { content_type: "text", parts: [text] },
-        metadata: {},
-      });
-    } else if (m.role === "tool") {
-      const text = `[Tool result for ${m.tool_call_id}]:\n${m.content}`;
-      out.push({
-        id: crypto.randomUUID(),
-        author: { role: "system" },
-        content: { content_type: "text", parts: [text] },
-        metadata: {},
-      });
+  for (const message of messages) {
+    const role = message?.role || "user";
+    if (role === "assistant" && Array.isArray(message.tool_calls)) {
+      parts.push(`assistant tool calls:\n${JSON.stringify(message.tool_calls, null, 2)}`);
+      continue;
     }
+    const name = message?.name ? ` ${message.name}` : "";
+    const content = messageContent(message?.content);
+    if (!content && role !== "tool") continue;
+    parts.push(`${role}${name}:\n${content}`);
+  }
+
+  return parts.join("\n\n").trim() || lastUserText(messages);
+}
+
+function parseToolCalls(text) {
+  const calls = [];
+  let remaining = text || "";
+  const parts = [];
+  while (true) {
+    const start = remaining.indexOf("<tool_call>");
+    if (start === -1) { parts.push(remaining); break; }
+    parts.push(remaining.slice(0, start));
+    const end = remaining.indexOf("</tool_call>", start + 11);
+    if (end === -1) { parts.push(remaining.slice(start)); break; }
+    const raw = remaining.slice(start + 11, end).trim();
+    try {
+      const parsed = JSON.parse(raw);
+      calls.push({
+        id: "call_" + crypto.randomUUID().replace(/-/g, "").slice(0, 16),
+        type: "function",
+        function: {
+          name: parsed.name || "",
+          arguments: typeof parsed.arguments === "string" ? parsed.arguments : JSON.stringify(parsed.arguments || {}),
+        },
+      });
+    } catch {
+      parts.push(`<tool_call>${raw}</tool_call>`);
+    }
+    remaining = remaining.slice(end + 12);
+  }
+  return { textContent: parts.join("").trim(), toolCalls: calls };
+}
+
+function appendFromEncodedItem(encoded) {
+  let out = "";
+  for (const line of String(encoded || "").split("\n")) {
+    if (!line.startsWith("data: ")) continue;
+    const data = line.slice(6);
+    if (!data || data === "[DONE]" || data.startsWith('"')) continue;
+    try {
+      const obj = JSON.parse(data);
+      if (obj.p === "/message/content/parts/0" && obj.o === "append") out += obj.v || "";
+      if (!obj.p && typeof obj.v === "string") out += obj.v;
+      if (obj.o === "patch" && Array.isArray(obj.v)) {
+        for (const op of obj.v) {
+          if (op.p === "/message/content/parts/0" && op.o === "append") out += op.v || "";
+        }
+      }
+    } catch {}
   }
   return out;
 }
 
-async function sendMessage(messages, tools) {
-  const cookie = await getCookieHeader();
-  const deviceId = await getDeviceId();
-
-  const baseHeaders = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148 Safari/537.36",
-    "Origin": "https://chatgpt.com",
-    "Referer": "https://chatgpt.com/",
-    "Cookie": cookie,
-  };
-
-  if (deviceId) baseHeaders["oai-device-id"] = deviceId;
-
-  const sResp = await httpsCall("POST", "/backend-api/sentinel/chat-requirements/prepare", {
-    ...baseHeaders,
-    "Content-Type": "text/plain;charset=UTF-8",
-  }, "{}");
-  if (sResp.status !== 200) throw new Error(`Sentinel ${sResp.status}: ${sResp.text.slice(0,200)}`);
-
-  const sentinel = JSON.parse(sResp.text);
-  const prepareToken = sentinel.prepare_token || sentinel.token || "";
-
-  const msgs = convertMessages(messages, tools);
-
-  const prepareBody = JSON.stringify({
-    action: "next",
-    messages: msgs,
-    parent_message_id: convState.parent_message_id,
-    model: "auto",
-    conversation_mode: { kind: "primary_assistant" },
-    ...(convState.conversation_id ? { conversation_id: convState.conversation_id } : {}),
-  });
-  const cpResp = await httpsCall("POST", "/backend-api/f/conversation/prepare", {
-    ...baseHeaders,
-    "Content-Type": "application/json",
-    "Openai-Sentinel-Chat-Requirements-Token": prepareToken,
-  }, prepareBody);
-  if (cpResp.status !== 200) throw new Error(`Conv prepare ${cpResp.status}: ${cpResp.text.slice(0,200)}`);
-
-  const conduitToken = JSON.parse(cpResp.text).conduit_token || "";
-
-  const now = Date.now() / 1000;
-  const convMsgs = msgs.map(m => ({
-    ...m,
-    create_time: now,
-    metadata: {
-      ...m.metadata,
-      selected_github_repos: [],
-      selected_all_github_repos: false,
-      serialization_metadata: { custom_symbol_offsets: [] },
-    },
-  }));
-  const convBody = JSON.stringify({
-    action: "next",
-    messages: convMsgs,
-    parent_message_id: convState.parent_message_id,
-    model: "auto",
-    client_prepare_state: "success",
-    timezone_offset_min: 180,
-    timezone: "America/Sao_Paulo",
-    conversation_mode: { kind: "primary_assistant" },
-    ...(convState.conversation_id ? { conversation_id: convState.conversation_id } : {}),
-    enable_message_followups: true,
-    system_hints: [],
-    supports_buffering: true,
-    supported_encodings: ["v1"],
-    client_contextual_info: {
-      is_dark_mode: true,
-      time_since_loaded: 21,
-      page_height: 935,
-      page_width: 1920,
-      pixel_ratio: 1,
-      screen_height: 1080,
-      screen_width: 1920,
-      app_name: "chatgpt.com",
-    },
-    paragen_cot_summary_display_override: "allow",
-    force_parallel_switch: "auto",
-  });
-
-  const conv = await httpsCall("POST", "/backend-api/f/conversation", {
-    ...baseHeaders,
-    "Openai-Sentinel-Chat-Requirements-Token": prepareToken,
-    "Openai-Sentinel-Conduit-Token": conduitToken,
-  }, convBody);
-
-  if (conv.status !== 200) {
-    throw new Error(`Conv ${conv.status}: ${conv.text.slice(0,800)}`);
+function collectEncodedItems(value, out = []) {
+  if (!value || typeof value !== "object") return out;
+  if (typeof value.encoded_item === "string") {
+    out.push({ id: value.stream_item_id || null, encoded: value.encoded_item });
   }
-
-  const result = parseSSE(conv.text);
-
-  if (result.conversation_id) convState.conversation_id = result.conversation_id;
-  if (result.assistant_id) {
-    convState.parent_message_id = result.assistant_id;
-    convState.last_assistant_id = result.assistant_id;
+  if (Array.isArray(value)) {
+    for (const item of value) collectEncodedItems(item, out);
+  } else {
+    for (const item of Object.values(value)) collectEncodedItems(item, out);
   }
+  return out;
+}
 
-  const text = result.text || "";
+function parseNetworkText(responses) {
+  let text = "";
+  const seen = new Set();
+  for (const item of responses || []) {
+    if (item.type !== "WebSocket" || item.event !== "frameReceived" || !item.data) continue;
+    try {
+      const frames = JSON.parse(item.data);
+      for (const encodedItem of collectEncodedItems(frames)) {
+        const key = `${encodedItem.id || ""}:${encodedItem.encoded}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        text += appendFromEncodedItem(encodedItem.encoded);
+      }
+    } catch {}
+  }
+  return text;
+}
 
-  const parsed = parseToolCallsFromContent(text);
+function nextNetworkChunks(responses, seen) {
+  const chunks = [];
+  for (const item of responses || []) {
+    if (item.type !== "WebSocket" || item.event !== "frameReceived" || !item.data) continue;
+    try {
+      const frames = JSON.parse(item.data);
+      for (const encodedItem of collectEncodedItems(frames)) {
+        const key = `${encodedItem.id || ""}:${encodedItem.encoded}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const text = appendFromEncodedItem(encodedItem.encoded);
+        if (text) chunks.push(text);
+      }
+    } catch {}
+  }
+  return chunks;
+}
+
+function streamJson(res, data) {
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function streamCompletion(res, text, parsed) {
+  const id = `chatcmpl-${Date.now()}`;
+  const created = Math.floor(Date.now() / 1000);
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "Access-Control-Allow-Origin": "*",
+  });
+  streamJson(res, {
+    id,
+    object: "chat.completion.chunk",
+    created,
+    model: "chatgpt-web",
+    choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+  });
   if (parsed.toolCalls.length > 0) {
-    return {
-      type: "tool_calls",
-      tool_calls: parsed.toolCalls.map(tc => ({
-        id: tc.id,
-        type: "function",
-        function: { name: tc.name, arguments: JSON.stringify(tc.arguments) },
-      })),
-      text: parsed.textContent,
-    };
+    parsed.toolCalls.forEach((call, index) => {
+      streamJson(res, {
+        id,
+        object: "chat.completion.chunk",
+        created,
+        model: "chatgpt-web",
+        choices: [{
+          index: 0,
+          delta: {
+            tool_calls: [{
+              index,
+              id: call.id,
+              type: call.type,
+              function: call.function,
+            }],
+          },
+          finish_reason: null,
+        }],
+      });
+    });
+  } else if (parsed.textContent) {
+    streamJson(res, {
+      id,
+      object: "chat.completion.chunk",
+      created,
+      model: "chatgpt-web",
+      choices: [{ index: 0, delta: { content: parsed.textContent }, finish_reason: null }],
+    });
   }
-
-  return { type: "text", text };
+  streamJson(res, {
+    id,
+    object: "chat.completion.chunk",
+    created,
+    model: "chatgpt-web",
+    choices: [{ index: 0, delta: {}, finish_reason: parsed.toolCalls.length > 0 ? "tool_calls" : "stop" }],
+  });
+  res.write("data: [DONE]\n\n");
+  res.end();
 }
 
-// Strip <tool_call>...</tool_call> from text for clean client display
-function stripToolCalls(text) {
-  return text.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '');
+function writeStreamStart(res) {
+  const id = `chatcmpl-${Date.now()}`;
+  const created = Math.floor(Date.now() / 1000);
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "Access-Control-Allow-Origin": "*",
+  });
+  streamJson(res, {
+    id,
+    object: "chat.completion.chunk",
+    created,
+    model: "chatgpt-web",
+    choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+  });
+  return { id, created };
 }
 
-function sendSSEChunk(res, id, created, delta, finishReason) {
-  const chunk = {
-    id, object: "chat.completion.chunk", created, model: "chatgpt-web",
-    choices: [{ index: 0, delta, finish_reason: finishReason || null }],
-  };
-  res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+function writeStreamContent(res, streamState, content) {
+  streamJson(res, {
+    id: streamState.id,
+    object: "chat.completion.chunk",
+    created: streamState.created,
+    model: "chatgpt-web",
+    choices: [{ index: 0, delta: { content }, finish_reason: null }],
+  });
 }
 
-function looksLikeToolRequest(messages) {
-  const lastUser = [...messages].reverse().find(m => m.role === "user")?.content || "";
-  return /cria|criar|create|write|escrev|edita|edit|delete|remove|pasta|folder|file|arquivo|roda|run|command|mkdir|leia|read|lista|list|dir/i.test(String(lastUser));
+function writeStreamDone(res, streamState, finishReason = "stop") {
+  streamJson(res, {
+    id: streamState.id,
+    object: "chat.completion.chunk",
+    created: streamState.created,
+    model: "chatgpt-web",
+    choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+  });
+  res.write("data: [DONE]\n\n");
+  res.end();
 }
 
-// ===== HTTP SERVER =====
+async function triggerComposerSend() {
+  const code = `
+(async () => {
+  const input = document.getElementById('prompt-textarea');
+  if (!input) return JSON.stringify({ok:false,error:'no prompt-textarea'});
+  input.focus();
+  input.textContent = '';
+  document.execCommand('insertText', false, '.');
+  input.dispatchEvent(new Event('input', {bubbles:true}));
+  await new Promise(r => setTimeout(r, 250));
+  const button = document.querySelector('#composer-submit-button,[data-testid="send-button"]');
+  if (!button) return JSON.stringify({ok:false,error:'no send button'});
+  button.click();
+  return JSON.stringify({ok:true});
+})()`;
+  const raw = await evalInTab(code, 20000);
+  const result = JSON.parse(raw);
+  if (!result.ok) throw new Error(result.error || "send trigger failed");
+}
+
+async function browserConversation(promptText) {
+  const id = await getChatGptTabId();
+  await relay(`/networkStart?tabId=${id}&filter=/backend-api/f/conversation`, null, 10000);
+
+  const rewritePayload = JSON.stringify({ text: promptText, once: true });
+  const rewrite = await relay(`/rewriteConversationStart?tabId=${id}`, rewritePayload, 10000, "application/json");
+  if (!rewrite.result?.ok) throw new Error(rewrite.result?.error || "rewrite start failed");
+
+  await triggerComposerSend();
+
+  const deadline = Date.now() + 120000;
+  let latestText = "";
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 1000));
+    const net = await relay("/networkResponses", null, 10000);
+    const responses = net.result?.responses || [];
+    latestText = parseNetworkText(responses) || latestText;
+    const complete = responses.some((item) => item.type === "WebSocket" && item.event === "frameReceived" && String(item.data || "").includes("message_stream_complete"));
+    if (complete && latestText) return latestText;
+  }
+  throw new Error(latestText ? `Timed out after partial response: ${latestText}` : "Timed out waiting for ChatGPT response");
+}
+
+async function browserConversationStream(promptText, res) {
+  const streamState = writeStreamStart(res);
+  const id = await getChatGptTabId();
+  await relay(`/networkStart?tabId=${id}&filter=/backend-api/f/conversation`, null, 10000);
+
+  const rewritePayload = JSON.stringify({ text: promptText, once: true });
+  const rewrite = await relay(`/rewriteConversationStart?tabId=${id}`, rewritePayload, 10000, "application/json");
+  if (!rewrite.result?.ok) throw new Error(rewrite.result?.error || "rewrite start failed");
+
+  await triggerComposerSend();
+
+  const seen = new Set();
+  const deadline = Date.now() + 120000;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 300));
+    const net = await relay("/networkResponses", null, 10000);
+    const responses = net.result?.responses || [];
+    for (const chunk of nextNetworkChunks(responses, seen)) {
+      writeStreamContent(res, streamState, chunk);
+    }
+    const complete = responses.some((item) => item.type === "WebSocket" && item.event === "frameReceived" && String(item.data || "").includes("message_stream_complete"));
+    if (complete) {
+      writeStreamDone(res, streamState);
+      return;
+    }
+  }
+  writeStreamDone(res, streamState, "stop");
+}
 
 http.createServer((req, res) => {
-  if (req.method === "GET" && req.url === "/") {
-    const filePath = path.join(__dirname, "..", "..", "index.html");
-    if (fs.existsSync(filePath)) {
-      const content = fs.readFileSync(filePath, "utf8");
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      return res.end(content);
-    }
-    return res.writeHead(404), res.end("index.html not found");
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type, Authorization" });
+    res.end();
+    return;
   }
 
-  if (req.method === "OPTIONS") return res.writeHead(204, {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS, PUT, DELETE",
-    "Access-Control-Allow-Headers": "*",
-    "Access-Control-Max-Age": "86400",
-  }), res.end();
-
-  if (req.method === "POST" && req.url === "/v1/chat/completions") {
-    log("INCOMING from:", req.socket.remoteAddress || "unknown");
+  if (req.method === "POST" && (req.url === "/v1/chat/completions" || req.url === "/v1/chat/completions-stream")) {
     let body = "";
-    req.on("data", c => { body += c; });
-    req.on("end", async () => {
-      log("req body len:", body.length);
-      try {
-        const p = JSON.parse(body);
-        if (p.messages && p.messages.length > 10) {
-          p.messages = p.messages.filter(m => m.role === "system").concat(p.messages.filter(m => m.role !== "system").slice(-10));
-        }
+    req.on("data", (c) => body += c);
+    req.on("end", () => {
+      let params;
+      try { params = JSON.parse(body); }
+      catch (err) { json(res, 400, { error: `Invalid JSON: ${err.message}` }); return; }
+
+      requestQueue = requestQueue.then(async () => {
         try {
-          if (p.stream) {
-            log("starting stream handler");
-            await handleStreamWithTimeout(p, res);
-            log("stream handler done");
+          const prompt = buildPrompt(params);
+          if (!prompt) throw new Error("No user message");
+          log("Sending via CDP rewrite...");
+          if (params.stream) {
+            if (Array.isArray(params.tools) && params.tools.length > 0) {
+              const text = await browserConversation(prompt);
+              const parsed = parseToolCalls(text);
+              streamCompletion(res, text, parsed);
+            } else {
+              await browserConversationStream(prompt, res);
+            }
             return;
           }
-
-          log("calling sendMessage");
-          const result = await sendMessage(p.messages || [], p.tools);
-
-          if (result.type === "tool_calls") {
-            log("tool calls detected, running server-side execution");
-            const toolCalls = result.tool_calls.map(tc => ({
-              id: tc.id,
-              name: tc.function.name,
-              arguments: typeof tc.function.arguments === 'string'
-                ? JSON.parse(tc.function.arguments)
-                : tc.function.arguments,
-            }));
-
-            const context = { messages: p.messages, turn: 0, model: p.model };
-            const toolResults = await executeToolCalls(toolCalls, context);
-
-            const msgs = [...p.messages];
-            msgs.push({ role: "assistant", content: result.text || null, tool_calls: result.tool_calls });
-            for (const tr of toolResults) {
-              msgs.push(buildToolMessage(tr));
-            }
-
-            const nextResult = await sendMessage(msgs, p.tools);
-
-            if (nextResult.type === "tool_calls") {
-              json(res, 200, {
-                id: `chatcmpl-${Date.now()}`,
-                object: "chat.completion",
-                created: Math.floor(Date.now() / 1000),
-                model: "chatgpt-web",
-                choices: [{ index: 0, message: { role: "assistant", content: null, tool_calls: nextResult.tool_calls }, finish_reason: "tool_calls" }],
-                usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-              });
-            } else {
-              json(res, 200, {
-                id: `chatcmpl-${Date.now()}`,
-                object: "chat.completion",
-                created: Math.floor(Date.now() / 1000),
-                model: "chatgpt-web",
-                choices: [{ index: 0, message: { role: "assistant", content: nextResult.text }, finish_reason: "stop" }],
-                usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-              });
-            }
-          } else {
-            json(res, 200, {
-              id: `chatcmpl-${Date.now()}`,
-              object: "chat.completion",
-              created: Math.floor(Date.now() / 1000),
-              model: "chatgpt-web",
-              choices: [{ index: 0, message: { role: "assistant", content: result.text }, finish_reason: "stop" }],
-              usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-            });
-          }
+          const text = await browserConversation(prompt);
+          const parsed = parseToolCalls(text);
+          json(res, 200, {
+            id: `chatcmpl-${Date.now()}`,
+            object: "chat.completion",
+            created: Math.floor(Date.now() / 1000),
+            model: "chatgpt-web",
+            choices: [{
+              index: 0,
+              message: parsed.toolCalls.length > 0
+                ? { role: "assistant", content: null, tool_calls: parsed.toolCalls }
+                : { role: "assistant", content: parsed.textContent },
+              finish_reason: parsed.toolCalls.length > 0 ? "tool_calls" : "stop",
+            }],
+            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+          });
         } catch (err) {
           log("ERROR:", err.message);
-          json(res, 500, { error: err.message });
+          if (!res.headersSent) json(res, 500, { error: err.message });
+          else {
+            res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+            res.write("data: [DONE]\n\n");
+            res.end();
+          }
         }
-      } catch (err) {
-        json(res, 400, { error: `Invalid JSON: ${err.message}` });
-      }
+      });
     });
     return;
   }
 
+  if (req.method === "POST" && req.url === "/api/session/new") {
+    json(res, 200, { ok: true });
+    return;
+  }
+
   if (req.url === "/v1/models") {
-    return json(res, 200, { object: "list", data: [{ id: "chatgpt-web", object: "model", created: Date.now(), owned_by: "openai" }] });
+    json(res, 200, { object: "list", data: [{ id: "chatgpt-web", object: "model", created: Date.now(), owned_by: "openai" }] });
+    return;
+  }
+
+  if ((req.method === "GET" || req.method === "HEAD") && (req.url === "/" || req.url === "/index.html")) {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    if (req.method === "HEAD") { res.end(); return; }
+    res.end(fs.readFileSync(UI_PATH, "utf8"));
+    return;
   }
 
   json(res, 404, { error: "Not found" });
 }).listen(PORT, () => {
   log(`Running on http://localhost:${PORT}`);
 });
-
-// ===== STREAMING WITH SERVER-SIDE TOOL LOOP =====
-
-async function handleStream(p, res) {
-  const cookie = await getCookieHeader();
-  const deviceId = await getDeviceId();
-  const baseHeaders = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148 Safari/537.36",
-    "Origin": "https://chatgpt.com",
-    "Referer": "https://chatgpt.com/",
-    "Cookie": cookie,
-  };
-  if (deviceId) baseHeaders["oai-device-id"] = deviceId;
-
-  const sResp = await httpsCall("POST", "/backend-api/sentinel/chat-requirements/prepare", { ...baseHeaders, "Content-Type": "text/plain;charset=UTF-8" }, "{}");
-  if (sResp.status !== 200) return json(res, 500, { error: `Sentinel ${sResp.status}` });
-  const prepareToken = (JSON.parse(sResp.text).prepare_token || "");
-
-  const loopMessages = [...(p.messages || [])];
-
-  const id = `chatcmpl-${Date.now()}`;
-  const created = Math.floor(Date.now() / 1000);
-  const shouldForceTool = looksLikeToolRequest(loopMessages);
-  let executedToolCount = 0;
-  let retryWithoutToolCount = 0;
-
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-cache",
-    "Connection": "keep-alive",
-    ...corsHeaders(),
-  });
-
-  const maxTurns = 10;
-  for (let turn = 0; turn < maxTurns; turn++) {
-    log(`stream turn ${turn + 1}/${maxTurns}`);
-    const msgs = convertMessages(loopMessages, p.tools);
-
-    const prepareBody = JSON.stringify({
-      action: "next", messages: msgs, parent_message_id: convState.parent_message_id,
-      model: "auto", conversation_mode: { kind: "primary_assistant" },
-      ...(convState.conversation_id ? { conversation_id: convState.conversation_id } : {}),
-    });
-    const cpResp = await httpsCall("POST", "/backend-api/f/conversation/prepare", { ...baseHeaders, "Content-Type": "application/json", "Openai-Sentinel-Chat-Requirements-Token": prepareToken }, prepareBody);
-    if (cpResp.status !== 200) {
-      if (turn === 0) return json(res, 500, { error: `Conv prepare ${cpResp.status}` });
-      break;
-    }
-    const conduitToken = JSON.parse(cpResp.text).conduit_token || "";
-
-    const nowTs = Date.now() / 1000;
-    const convMsgs = msgs.map(m => ({ ...m, create_time: nowTs, metadata: { ...m.metadata, selected_github_repos: [], selected_all_github_repos: false, serialization_metadata: { custom_symbol_offsets: [] } } }));
-    const convBody = JSON.stringify({
-      action: "next", messages: convMsgs, parent_message_id: convState.parent_message_id,
-      model: "auto", client_prepare_state: "success", timezone_offset_min: 180,
-      timezone: "America/Sao_Paulo", conversation_mode: { kind: "primary_assistant" },
-      ...(convState.conversation_id ? { conversation_id: convState.conversation_id } : {}),
-      enable_message_followups: true, system_hints: [], supports_buffering: true,
-      supported_encodings: ["v1"],
-      client_contextual_info: { is_dark_mode: true, time_since_loaded: 21, page_height: 935, page_width: 1920, pixel_ratio: 1, screen_height: 1080, screen_width: 1920, app_name: "chatgpt.com" },
-      paragen_cot_summary_display_override: "allow", force_parallel_switch: "auto",
-    });
-
-    let sseBuffer = "", lastP = "", lastO = "", roleSentInTurn = false, collectedText = "";
-    const toolStreamParser = new StreamingToolParser();
-
-    const emitCleanText = (clean) => {
-      if (!clean) return;
-      if (!roleSentInTurn) {
-        sendSSEChunk(res, id, created, { role: "assistant", content: clean }, null);
-        roleSentInTurn = true;
-      } else {
-        sendSSEChunk(res, id, created, { content: clean }, null);
-      }
-    };
-
-    await new Promise((resolve, reject) => {
-      const convReq = https.request(new URL("https://chatgpt.com/backend-api/f/conversation"), {
-        method: "POST",
-        headers: { ...baseHeaders, "Openai-Sentinel-Chat-Requirements-Token": prepareToken, "Openai-Sentinel-Conduit-Token": conduitToken },
-      }, (convRes) => {
-        convRes.setEncoding("utf8");
-        convRes.on("data", (chunk) => {
-          sseBuffer += chunk;
-          const parts = sseBuffer.split(/\n\n/);
-          sseBuffer = parts.pop() || "";
-
-          for (const part of parts) {
-            const dataMatch = part.match(/^data: (.+)/m);
-            if (!dataMatch) continue;
-            const payload = dataMatch[1];
-            if (payload === "[DONE]") continue;
-
-            try {
-              const obj = JSON.parse(payload);
-              if (typeof obj !== "object") continue;
-
-              if (obj.type === "resume_conversation_token" && obj.conversation_id) {
-                convState.conversation_id = obj.conversation_id;
-              }
-              if (obj.v?.message?.author?.role === "assistant" && obj.v?.message?.id) {
-                convState.parent_message_id = obj.v.message.id;
-                convState.last_assistant_id = obj.v.message.id;
-              }
-
-              const curP = obj.p !== undefined ? obj.p : lastP;
-              const curO = obj.o !== undefined ? obj.o : lastO;
-              lastP = curP; lastO = curO;
-
-              // Helper to stream a clean text chunk (tool calls stripped)
-              const streamText = (t) => {
-                collectedText += t;
-                const parsedChunk = toolStreamParser.feed(t);
-                emitCleanText(parsedChunk.text);
-              };
-
-              if (curP === "/message/content/parts/0" && curO === "append") {
-                const t = obj.v || "";
-                if (t) streamText(t);
-              }
-
-              if (curO === "patch" && Array.isArray(obj.v)) {
-                for (const op of obj.v) {
-                  if (op.p === "/message/content/parts/0" && op.o === "append") {
-                    const t = op.v || "";
-                    if (t) streamText(t);
-                  }
-                }
-              }
-            } catch {}
-          }
-        });
-        convRes.on("end", () => {
-          const finalChunk = toolStreamParser.flush();
-          emitCleanText(finalChunk.text);
-          if (!roleSentInTurn && !collectedText) {
-            sendSSEChunk(res, id, created, { role: "assistant", content: "" }, null);
-          }
-          resolve();
-        });
-        convRes.on("error", reject);
-      });
-      convReq.on("error", reject);
-      convReq.write(convBody);
-      convReq.end();
-    });
-
-    // Parse for tool calls
-    const parsed = parseToolCallsFromContent(collectedText);
-
-    if (parsed.toolCalls.length === 0) {
-      if (shouldForceTool && executedToolCount === 0 && retryWithoutToolCount < 2) {
-        retryWithoutToolCount++;
-        loopMessages.push({ role: "assistant", content: collectedText || "" });
-        loopMessages.push({
-          role: "user",
-          content: "You did not call a tool. The requested operation will not happen unless you call a tool. Respond ONLY with the correct <tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call> now.",
-        });
-        log(`turn ${turn + 1}: no tool call for tool request, retrying (${retryWithoutToolCount}/2)`);
-        continue;
-      }
-      sendSSEChunk(res, id, created, {}, "stop");
-      res.write("data: [DONE]\n\n");
-      res.end();
-      return;
-    }
-
-    log(`turn ${turn + 1}: ${parsed.toolCalls.length} tool calls, executing server-side...`);
-
-    const toolCallsForMsg = parsed.toolCalls.map(tc => ({
-      id: tc.id,
-      type: "function",
-      function: { name: tc.name, arguments: JSON.stringify(tc.arguments) },
-    }));
-
-    loopMessages.push({ role: "assistant", content: parsed.textContent || null, tool_calls: toolCallsForMsg });
-
-    const context = { messages: loopMessages, turn, model: "chatgpt-web" };
-    const toolResults = await executeToolCalls(parsed.toolCalls, context);
-    executedToolCount += parsed.toolCalls.length;
-
-    for (const tr of toolResults) {
-      loopMessages.push(buildToolMessage(tr));
-    }
-
-    log(`turn ${turn + 1}: tools executed (${toolResults.filter(r => r.isError).length} errors)`);
-
-    if (turn >= maxTurns - 1) {
-      sendSSEChunk(res, id, created, {}, "tool_calls");
-      res.write("data: [DONE]\n\n");
-      res.end();
-      return;
-    }
-  }
-
-  sendSSEChunk(res, id, created, {}, "stop");
-  res.write("data: [DONE]\n\n");
-  res.end();
-}
-
-async function handleStreamWithTimeout(p, res) {
-  const timer = setTimeout(() => {
-    log("STREAM TIMEOUT");
-    try { res.write("data: [DONE]\n\n"); res.end(); } catch {}
-  }, 120000);
-  try { await handleStream(p, res); }
-  finally { clearTimeout(timer); }
-}

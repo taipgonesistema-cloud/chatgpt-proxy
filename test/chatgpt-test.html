@@ -90,13 +90,38 @@ async function send() {
       body: JSON.stringify({
         model: 'chatgpt-web',
         messages: [{ role: 'user', content: text }],
-        stream: false,
+        stream: true,
       }),
       signal: AbortSignal.timeout(120000),
     });
-    const data = await r.json();
-    const reply = data?.choices?.[0]?.message?.content || '⚠️ Resposta vazia';
-    thinkingDiv.innerHTML = `<div class="label">ChatGPT</div><span>${escapeHtml(reply)}</span>`;
+    if (!r.ok) throw new Error(await r.text());
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let reply = '';
+    thinkingDiv.innerHTML = '<div class="label">ChatGPT</div><span></span>';
+    const span = thinkingDiv.querySelector('span');
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const events = buffer.split('\n\n');
+      buffer = events.pop() || '';
+      for (const event of events) {
+        const line = event.split('\n').find(l => l.startsWith('data: '));
+        if (!line) continue;
+        const data = line.slice(6);
+        if (data === '[DONE]') continue;
+        const chunk = JSON.parse(data);
+        const delta = chunk?.choices?.[0]?.delta?.content || '';
+        if (delta) {
+          reply += delta;
+          span.textContent = reply;
+          chat.scrollTop = chat.scrollHeight;
+        }
+      }
+    }
+    if (!reply) span.textContent = '⚠️ Resposta vazia';
   } catch (err) {
     thinkingDiv.innerHTML = `<div class="label">ChatGPT</div><span style="color:#f87171">Erro: ${escapeHtml(err.message)}</span>`;
   }

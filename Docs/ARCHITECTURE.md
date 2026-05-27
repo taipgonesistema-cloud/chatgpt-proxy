@@ -2,51 +2,80 @@
 
 ## Overview
 
-```
-Client (OpenAI SDK / curl / test.html)
+```text
+OpenAI client / Pi / UI
         |
-        v  POST /v1/chat/completions
-  chatgpt-proxy (port 9225)
-        |
-        v  relays cookies via HTTP
-  browser-bridge relay (port 9223)
-        |  (Chrome DevTools Protocol)
         v
-  chatgpt.com (real ChatGPT API)
+  chatgpt-proxy :9225
+        |
+        v
+  BrowserBridge relay :9223
+        |
+        v
+  BrowserBridge extension via CDP
+        |
+        v
+  logged-in ChatGPT tab
 ```
 
-The proxy translates the OpenAI `/v1/chat/completions` format into ChatGPT's internal API calls.
+The proxy does not replay captured ChatGPT credentials. Instead, it lets the browser create a valid ChatGPT request and rewrites only the POST body before the request leaves the browser.
+
+## Main Components
+
+| Component | Responsibility |
+|---|---|
+| `src/proxy.js` | OpenAI-compatible API, prompt/tool conversion, CDP orchestration, SSE conversion |
+| `src/file-server.js` | Local project file actions for the web UI |
+| `../browser-bridge/relay.js` | HTTP relay to the extension WebSocket |
+| `../browser-bridge/extension/background.js` | CDP debugger attach, network capture, Fetch rewrite |
 
 ## Request Flow
 
-1. **Sentinel** `POST /backend-api/sentinel/chat-requirements/prepare`
-   - Body: `{}`
-   - Returns `prepare_token` for the next step
+1. Client sends `POST /v1/chat/completions`.
+2. The proxy builds a single ChatGPT prompt from OpenAI messages, tool schemas, and the Pi agent contract.
+3. The proxy starts BrowserBridge network capture for `/backend-api/f/conversation`.
+4. The proxy starts Fetch rewrite through `/rewriteConversationStart`.
+5. The proxy triggers ChatGPT's composer with a placeholder.
+6. The extension receives `Fetch.requestPaused` for the real conversation POST.
+7. The extension replaces the body with the desired prompt and continues the request.
+8. The browser sends the request with valid ChatGPT-generated headers/tokens.
+9. The proxy polls `/networkResponses` and parses WebSocket `encoded_item` frames.
+10. The proxy returns OpenAI-compatible JSON or `text/event-stream` chunks.
 
-2. **Conversation Prepare** `POST /backend-api/f/conversation/prepare`
-   - Body: full conversation context (messages, parent_message_id, model, etc.)
-   - Returns `conduit_token` for the main call
+## Why Not Direct HTTPS
 
-3. **Conversation** `POST /backend-api/f/conversation`
-   - Body: full conversation with metadata
-   - Returns SSE stream with delta-encoded response
+Direct HTTPS calls with captured headers failed with 403 because Turnstile/proof/sentinel tokens are tied to a fresh browser request. CDP rewrite keeps those headers fresh by preserving the browser's request and changing only the body.
 
-## SSE Parsing
+## Streaming Parser
 
-ChatGPT uses delta-encoding with three event patterns:
+ChatGPT WebSocket frames contain `encoded_item` strings with SSE-like data. Text deltas can appear as:
 
-| Pattern | Meaning |
-|---------|---------|
-| `{"p":"/message/content/parts/0", "o":"append", "v":"text"}` | Append text to assistant message |
-| `{"v": "text continuation"}` | Shorthand — inherits `p` and `o` from previous event |
-| `{"o":"patch", "v":[{sub-operations}]}` | Batch of operations, may include text append |
+| Shape | Meaning |
+|---|---|
+| `{"p":"/message/content/parts/0","o":"append","v":"text"}` | Append text |
+| `{"v":"continued text"}` | Pathless continuation |
+| `{"o":"patch","v":[...]}` | Patch list with append operations |
 
-The parser tracks `lastP` / `lastO` to handle shorthand events, and recurses into `patch` arrays.
+The parser deduplicates frames by both `stream_item_id` and encoded payload. Deduplicating only by `stream_item_id` can truncate responses because multiple chunks can share context.
 
-## Multi-turn
+## Tool Calling
 
-`convState` stores `conversation_id` and `parent_message_id` (last assistant message ID). Each request passes these so ChatGPT sees the full conversation history.
+ChatGPT Web does not expose native OpenAI tool calls here, so the proxy uses a prompt contract:
 
-## Session
+```text
+<tool_call>{"name":"tool_name","arguments":{"arg":"value"}}</tool_call>
+```
 
-Cookies are fetched from the browser via browser-bridge relay and cached for 30s. `oai-device-id` is extracted from the `oai-did` cookie.
+The proxy parses those wrappers and emits OpenAI-compatible `tool_calls` with `finish_reason: "tool_calls"`. Pi then executes the tool and sends the result back in a follow-up request.
+
+## Concurrency
+
+`src/proxy.js` serializes requests with an in-process queue because one browser tab/composer is used as the transport. This avoids overlapping rewrites and mixed WebSocket captures.
+
+## Limitations
+
+- Requires a live logged-in ChatGPT tab.
+- Requires BrowserBridge extension debugger access.
+- One request at a time per proxy process.
+- ChatGPT DOM selectors and transport details can change.
+- Tool calls are prompt-based and can require parser/prompt updates if model formatting changes.
