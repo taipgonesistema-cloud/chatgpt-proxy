@@ -206,14 +206,16 @@ O [pi.dev](https://pi.dev) é um agente de terminal que funciona nativamente com
 
 ```json
 {
-  "chatgpt-web": {
-    "baseUrl": "http://localhost:9225/v1",
-    "api": "openai-completions",
-    "compat": {
-      "supportsDeveloperRole": false,
-      "supportsReasoningEffort": false
-    },
-    "models": [{ "id": "chatgpt-web" }]
+  "providers": {
+    "chatgpt-web": {
+      "baseUrl": "http://localhost:9225/v1",
+      "api": "openai-completions",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false
+      },
+      "models": [{ "id": "chatgpt-web" }]
+    }
   }
 }
 ```
