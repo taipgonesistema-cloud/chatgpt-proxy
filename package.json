@@ -2,10 +2,12 @@
   "name": "chatgpt-proxy",
   "version": "1.0.0",
   "type": "module",
-  "description": "OpenAI-compatible proxy for ChatGPT using browser-bridge relay",
+  "description": "OpenAI-compatible proxy for ChatGPT Web using a private browser worker",
   "main": "src/proxy.js",
   "scripts": {
     "start": "node src/proxy.js",
+    "login": "node worker/login.cjs",
+    "worker": "node worker/worker.cjs",
     "test": "node test/manual.js"
   },
   "keywords": ["chatgpt", "proxy", "openai", "api"],

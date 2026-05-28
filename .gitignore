@@ -1,3 +1,42 @@
 node_modules/
+
+# Env/secrets
 .env
+.env.*
+!.env.example
+
+# Logs/runtime output
 *.log
+*.pid
+*.out
+*.err
+logs/
+
+# Local browser profiles and captures
+worker/.profile/
+worker/profile/
+captures/
+*.trace.json
+*.heapsnapshot
+
+# Temporary/debug files
+*.tmp
+*.bak
+*.backup
+*.sse
+*-debug.*
+request-debug.*
+last-*
+
+# Local-only test helpers
+scripts/kill-port.cmd
+scripts/test-*.cmd
+scripts/headless-check.cmd
+scripts/start-pi-proxy.cmd
+scripts/start-worker-headless.cmd
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

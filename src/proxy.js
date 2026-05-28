@@ -4,7 +4,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 
 const PORT = Number(process.env.PORT || 9225);
-const RELAY = "http://localhost:9223";
+const RELAY = (process.env.BROWSER_BACKEND_URL || process.env.BROWSER_RELAY_URL || "http://localhost:9223").replace(/\/+$/, "");
+const PROXY_API_KEY = process.env.PROXY_API_KEY || "";
 const UI_PATH = "C:\\Users\\Desktop\\Desktop\\yk\\index.html";
 const PI_AGENT_CONTRACT = [
   "You are a precise, pragmatic software engineering agent running inside Pi Coding Agent.",
@@ -61,9 +62,33 @@ function json(res, status, data) {
     "Content-Type": "application/json; charset=utf-8",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key",
   });
   res.end(JSON.stringify(data));
+}
+
+function isAuthorized(req) {
+  if (!PROXY_API_KEY) return true;
+  const auth = Array.isArray(req.headers.authorization) ? req.headers.authorization[0] : req.headers.authorization;
+  const apiKey = Array.isArray(req.headers["x-api-key"]) ? req.headers["x-api-key"][0] : req.headers["x-api-key"];
+  return auth === `Bearer ${PROXY_API_KEY}` || apiKey === PROXY_API_KEY;
+}
+
+function unauthorized(res) {
+  json(res, 401, { error: "Unauthorized" });
+}
+
+function v1Info() {
+  return {
+    object: "api.compat",
+    compatible_with: "openai-chat-completions",
+    base_url: `http://localhost:${PORT}/v1`,
+    models_url: "/v1/models",
+    chat_completions_url: "/v1/chat/completions",
+    model: "chatgpt-web",
+    streaming: true,
+    auth: PROXY_API_KEY ? "bearer" : "none",
+  };
 }
 
 function relay(path, body = null, timeoutMs = 60000, contentType = "text/plain;charset=UTF-8") {
@@ -97,7 +122,16 @@ async function getChatGptTabId() {
   if (tabId) return tabId;
   const r = await relay("/tabs", null, 10000);
   const tabs = r?.result || [];
-  const tab = tabs.find((t) => t.url?.startsWith("https://chatgpt.com"));
+  let tab = tabs.find((t) => t.url?.startsWith("https://chatgpt.com"));
+  if (!tab && process.env.CHATGPT_AUTO_OPEN !== "0") {
+    const opened = await relay(`/newTab?url=${encodeURIComponent("https://chatgpt.com/")}`, null, 30000).catch(() => null);
+    if (opened?.result?.id) tab = { id: opened.result.id, url: opened.result.url };
+    if (!tab) {
+      await sleep(1000);
+      const retry = await relay("/tabs", null, 10000);
+      tab = (retry?.result || []).find((t) => t.url?.startsWith("https://chatgpt.com"));
+    }
+  }
   if (!tab) throw new Error("No ChatGPT tab found");
   tabId = tab.id;
   return tab.id;
@@ -941,12 +975,13 @@ async function browserConversationStream(promptText, res) {
 
 http.createServer((req, res) => {
   if (req.method === "OPTIONS") {
-    res.writeHead(204, { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type, Authorization" });
+    res.writeHead(204, { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key" });
     res.end();
     return;
   }
 
   if (req.method === "POST" && (req.url === "/v1/chat/completions" || req.url === "/v1/chat/completions-stream")) {
+    if (!isAuthorized(req)) { unauthorized(res); return; }
     let body = "";
     req.on("data", (c) => body += c);
     req.on("end", () => {
@@ -1005,11 +1040,19 @@ http.createServer((req, res) => {
   }
 
   if (req.method === "POST" && req.url === "/api/session/new") {
+    if (!isAuthorized(req)) { unauthorized(res); return; }
     json(res, 200, { ok: true });
     return;
   }
 
+  if (req.method === "GET" && (req.url === "/v1" || req.url === "/v1/")) {
+    if (!isAuthorized(req)) { unauthorized(res); return; }
+    json(res, 200, v1Info());
+    return;
+  }
+
   if (req.url === "/v1/models") {
+    if (!isAuthorized(req)) { unauthorized(res); return; }
     json(res, 200, { object: "list", data: [{ id: "chatgpt-web", object: "model", created: Date.now(), owned_by: "openai" }] });
     return;
   }
@@ -1024,4 +1067,6 @@ http.createServer((req, res) => {
   json(res, 404, { error: "Not found" });
 }).listen(PORT, () => {
   log(`Running on http://localhost:${PORT}`);
+  log(`Browser backend: ${RELAY}`);
+  if (PROXY_API_KEY) log("API key auth enabled");
 });
