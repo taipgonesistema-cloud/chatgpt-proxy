@@ -35,6 +35,9 @@ scripts/headless-check.cmd
 scripts/start-pi-proxy.cmd
 scripts/start-worker-headless.cmd
 
+# Walkthrough / notes
+WALKTHROUGH.md
+
 # OS/editor
 .DS_Store
 Thumbs.db
