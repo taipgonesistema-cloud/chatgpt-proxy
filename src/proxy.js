@@ -213,34 +213,72 @@ function parseNetworkText(responses) {
   let text = "";
   const seen = new Set();
   for (const item of responses || []) {
-    if (item.type !== "WebSocket" || item.event !== "frameReceived" || !item.data) continue;
-    try {
-      const frames = JSON.parse(item.data);
-      for (const encodedItem of collectEncodedItems(frames)) {
-        const key = `${encodedItem.id || ""}:${encodedItem.encoded}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        text += appendFromEncodedItem(encodedItem.encoded);
-      }
-    } catch {}
+    if (item.type === "WebSocket" && item.event === "frameReceived" && item.data) {
+      try {
+        const frames = JSON.parse(item.data);
+        for (const encodedItem of collectEncodedItems(frames)) {
+          const key = `${encodedItem.id || ""}:${encodedItem.encoded}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          text += appendFromEncodedItem(encodedItem.encoded);
+        }
+      } catch {}
+      continue;
+    }
+
+    if (isConversationSseBody(item)) {
+      const key = `${item.requestId || item.url}:body:${item.body}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      text += appendFromEncodedItem(item.body);
+    }
   }
   return text;
+}
+
+function isConversationSseBody(item) {
+  return item?.type === "Fetch"
+    && String(item.url || "").includes("/backend-api/f/conversation")
+    && !String(item.url || "").includes("/prepare")
+    && typeof item.body === "string"
+    && item.body.length > 0;
+}
+
+function hasCompletionSignal(responses) {
+  return (responses || []).some((item) => {
+    const data = String(item.data || "");
+    const body = String(item.body || "");
+    return data.includes("message_stream_complete")
+      || data.includes("[DONE]")
+      || body.includes("message_stream_complete")
+      || body.includes("data: [DONE]");
+  });
 }
 
 function nextNetworkChunks(responses, seen) {
   const chunks = [];
   for (const item of responses || []) {
-    if (item.type !== "WebSocket" || item.event !== "frameReceived" || !item.data) continue;
-    try {
-      const frames = JSON.parse(item.data);
-      for (const encodedItem of collectEncodedItems(frames)) {
-        const key = `${encodedItem.id || ""}:${encodedItem.encoded}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        const text = appendFromEncodedItem(encodedItem.encoded);
-        if (text) chunks.push(text);
-      }
-    } catch {}
+    if (item.type === "WebSocket" && item.event === "frameReceived" && item.data) {
+      try {
+        const frames = JSON.parse(item.data);
+        for (const encodedItem of collectEncodedItems(frames)) {
+          const key = `${encodedItem.id || ""}:${encodedItem.encoded}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const text = appendFromEncodedItem(encodedItem.encoded);
+          if (text) chunks.push(text);
+        }
+      } catch {}
+      continue;
+    }
+
+    if (isConversationSseBody(item)) {
+      const key = `${item.requestId || item.url}:body:${item.body}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const text = appendFromEncodedItem(item.body);
+      if (text) chunks.push(text);
+    }
   }
   return chunks;
 }
@@ -384,7 +422,7 @@ async function browserConversation(promptText) {
     const net = await relay("/networkResponses", null, 10000);
     const responses = net.result?.responses || [];
     latestText = parseNetworkText(responses) || latestText;
-    const complete = responses.some((item) => item.type === "WebSocket" && item.event === "frameReceived" && String(item.data || "").includes("message_stream_complete"));
+    const complete = hasCompletionSignal(responses);
     if (complete && latestText) return latestText;
   }
   throw new Error(latestText ? `Timed out after partial response: ${latestText}` : "Timed out waiting for ChatGPT response");
@@ -410,7 +448,7 @@ async function browserConversationStream(promptText, res) {
     for (const chunk of nextNetworkChunks(responses, seen)) {
       writeStreamContent(res, streamState, chunk);
     }
-    const complete = responses.some((item) => item.type === "WebSocket" && item.event === "frameReceived" && String(item.data || "").includes("message_stream_complete"));
+    const complete = hasCompletionSignal(responses);
     if (complete) {
       writeStreamDone(res, streamState);
       return;
