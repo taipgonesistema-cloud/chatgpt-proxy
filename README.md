@@ -200,6 +200,41 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+## Uso com pi.dev
+
+O [pi.dev](https://pi.dev) e um agente de terminal que funciona nativamente com este proxy. Configure o arquivo de modelos em `~/.pi/agent/models.json`:
+
+```json
+{
+  "chatgpt-web": {
+    "baseUrl": "http://localhost:9225/v1",
+    "api": "openai-completions",
+    "apiKey": "dummy",
+    "compat": {
+      "supportsDeveloperRole": false,
+      "supportsReasoningEffort": false
+    },
+    "models": [{ "id": "chatgpt-web" }]
+  }
+}
+```
+
+### Sem tools (chat simples)
+
+```bash
+pi --offline --no-tools --model chatgpt-web/chatgpt-web -p "Responda exatamente: pi-ok"
+```
+
+### Com tools (bash, leitura de arquivos, etc.)
+
+```bash
+pi --offline --model chatgpt-web/chatgpt-web -p "Use uma ferramenta para ver onde estamos e responda apenas com o caminho atual."
+```
+
+O proxy converte automaticamente chamadas de ferramenta do prompt em `tool_calls` OpenAI-compatible. Pi executa a ferramenta e retorna o resultado numa chamada seguinte.
+
+Maior compatibilidade: use sempre `--offline` para evitar processamento cloud que pode conflitar com o modelo `chatgpt-web`. O modelo `chatgpt-web` nao suporta `developer` role nem `reasoning_effort`; essas flags sao ignoradas automaticamente pelo proxy.
+
 ## Variaveis de ambiente
 
 | Variavel | Padrao | Descricao |
