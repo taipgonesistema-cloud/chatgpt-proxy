@@ -1,12 +1,11 @@
 import http from "node:http";
 import https from "node:https";
 import crypto from "node:crypto";
-import fs from "node:fs";
 
 const PORT = Number(process.env.PORT || 9225);
 const RELAY = (process.env.BROWSER_BACKEND_URL || process.env.BROWSER_RELAY_URL || "http://localhost:9223").replace(/\/+$/, "");
 const PROXY_API_KEY = process.env.PROXY_API_KEY || "";
-const UI_PATH = "C:\\Users\\Desktop\\Desktop\\yk\\index.html";
+
 const PI_AGENT_CONTRACT = [
   "You are a precise, pragmatic software engineering agent running inside Pi Coding Agent.",
   "Your priorities are correctness, evidence, minimal safe changes, and clear concise communication.",
@@ -1054,13 +1053,6 @@ http.createServer((req, res) => {
   if (req.url === "/v1/models") {
     if (!isAuthorized(req)) { unauthorized(res); return; }
     json(res, 200, { object: "list", data: [{ id: "chatgpt-web", object: "model", created: Date.now(), owned_by: "openai" }] });
-    return;
-  }
-
-  if ((req.method === "GET" || req.method === "HEAD") && (req.url === "/" || req.url === "/index.html")) {
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    if (req.method === "HEAD") { res.end(); return; }
-    res.end(fs.readFileSync(UI_PATH, "utf8"));
     return;
   }
 
