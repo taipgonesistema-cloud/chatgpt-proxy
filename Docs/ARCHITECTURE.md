@@ -9,10 +9,10 @@ OpenAI client / Pi / UI
   chatgpt-proxy :9225
         |
         v
-  BrowserBridge relay :9223
+  browser-worker :9233  (Node.js CDP client)
         |
         v
-  BrowserBridge extension via CDP
+  Chrome DevTools Protocol :9224
         |
         v
   logged-in ChatGPT tab
@@ -26,20 +26,20 @@ The proxy does not replay captured ChatGPT credentials. Instead, it lets the bro
 |---|---|
 | `src/proxy.js` | OpenAI-compatible API, prompt/tool conversion, CDP orchestration, SSE conversion |
 | `src/file-server.js` | Local project file actions for the web UI |
-| `../browser-bridge/relay.js` | HTTP relay to the extension WebSocket |
-| `../browser-bridge/extension/background.js` | CDP debugger attach, network capture, Fetch rewrite |
+| `worker/worker.cjs` | CDP client that controls Chrome directly (replaces BrowserBridge relay + extension) |
+| `worker/login.cjs` | Helper to log into ChatGPT with a visible Chrome window |
 
 ## Request Flow
 
 1. Client sends `POST /v1/chat/completions`.
 2. The proxy builds a single ChatGPT prompt from OpenAI messages, tool schemas, and the Pi agent contract.
-3. The proxy starts BrowserBridge network capture for `/backend-api/f/conversation`.
-4. The proxy starts Fetch rewrite through `/rewriteConversationStart`.
-5. The proxy triggers ChatGPT's composer with a placeholder.
-6. The extension receives `Fetch.requestPaused` for the real conversation POST.
-7. The extension replaces the body with the desired prompt and continues the request.
+3. The proxy starts network capture on the worker (`/networkStart`).
+4. The proxy starts Fetch rewrite on the worker (`/rewriteConversationStart`).
+5. The proxy triggers ChatGPT's composer with a placeholder via the worker.
+6. The worker receives `Fetch.requestPaused` for the real conversation POST.
+7. The worker replaces the body with the desired prompt and continues the request.
 8. The browser sends the request with valid ChatGPT-generated headers/tokens.
-9. The proxy polls `/networkResponses` and parses WebSocket `encoded_item` frames.
+9. The proxy polls `/networkResponses` on the worker and parses WebSocket `encoded_item` frames.
 10. The proxy returns OpenAI-compatible JSON or `text/event-stream` chunks.
 
 ## Why Not Direct HTTPS
@@ -60,7 +60,7 @@ The parser deduplicates frames by both `stream_item_id` and encoded payload. Ded
 
 ## Tool Calling
 
-ChatGPT Web does not expose native OpenAI tool calls here, so the proxy uses a prompt contract:
+ChatGPT Web does not expose native OpenAI tool calls, so the proxy uses a prompt contract:
 
 ```text
 <tool_call>{"name":"tool_name","arguments":{"arg":"value"}}</tool_call>
@@ -75,7 +75,8 @@ The proxy parses those wrappers and emits OpenAI-compatible `tool_calls` with `f
 ## Limitations
 
 - Requires a live logged-in ChatGPT tab.
-- Requires BrowserBridge extension debugger access.
+- Requires a Chrome instance with remote debugging enabled (`--remote-debugging-port=9224`).
 - One request at a time per proxy process.
 - ChatGPT DOM selectors and transport details can change.
 - Tool calls are prompt-based and can require parser/prompt updates if model formatting changes.
+- Headless mode is not reliable; ChatGPT shows a verification screen that blocks token capture.
