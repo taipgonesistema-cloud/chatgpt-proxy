@@ -28,6 +28,10 @@ const PI_TOOL_CONTRACT = [
   "Pi can execute tools for you, but only if your response is valid structured tool-call text.",
   "When a tool is needed, output only tool calls and nothing else.",
   "Do not answer the result of a command or file operation yourself; that result only exists after Pi executes the tool.",
+  "Prefer small, verifiable tool calls over one huge shell command.",
+  "For multi-file work, create directories, write one or a few files, then verify with a listing command.",
+  "When creating files, verify that required files are non-empty and contain the expected kind of content, not only that paths exist.",
+  "Avoid long bash heredocs when possible; malformed heredocs break execution.",
   "Use exactly this form, with valid JSON inside:",
   '<tool_call>{"name":"tool_name","arguments":{"arg":"value"}}</tool_call>',
   "Never put tool calls in Markdown code fences.",
@@ -120,6 +124,14 @@ function hasToolResult(messages) {
   return (messages || []).some((m) => m?.role === "tool" || m?.role === "toolResult");
 }
 
+function implementationTaskRequested(text) {
+  return /\b(create|criar|crie|write|escrever|editar|edit|mkdir|pasta|folder|arquivo|file|landing|page|implementar|implement|corrigir|fix|gerar|generate)\b/i.test(String(text || ""));
+}
+
+function canContinueAfterToolResult(params) {
+  return implementationTaskRequested(lastUserText(Array.isArray(params?.messages) ? params.messages : []));
+}
+
 function messageContent(content) {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -202,11 +214,15 @@ function buildPrompt(params) {
   }
 
   if (tools.length > 0 && hasToolResult(messages)) {
+    const canContinue = canContinueAfterToolResult(params);
     parts.push([
       "Tool result handling:",
       "A tool result is already present in the conversation.",
-      "Use that observed result to answer the user now.",
-      "Do not call the same tool again unless the result is missing, failed, or explicitly insufficient.",
+      canContinue
+        ? "If the user's requested file/code task is incomplete, continue with the next small, different tool call. If it is complete, answer final text."
+        : "Your next response MUST be final text for the user, not another tool call.",
+      "Use observed tool results as evidence.",
+      "Do not repeat the exact same tool call unless the previous result failed and retrying is clearly necessary.",
     ].join("\n"));
   }
 
@@ -239,29 +255,225 @@ function parseToolCalls(text) {
     }
     return null;
   };
+  const normalizedCalls = (parsed) => {
+    const items = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray(parsed?.tool_calls)
+      ? parsed.tool_calls
+      : [parsed];
+    return items.map((item) => {
+      const fn = item?.function || item || {};
+      let args = fn.arguments ?? item?.arguments ?? {};
+      if (typeof args === "string") {
+        try { args = JSON.parse(args); }
+        catch {}
+      }
+      return { name: fn.name || item?.name || "", arguments: args };
+    }).filter((item) => item.name);
+  };
+  const pushParsed = (parsed) => {
+    for (const item of normalizedCalls(parsed)) {
+      calls.push({
+        id: "call_" + crypto.randomUUID().replace(/-/g, "").slice(0, 16),
+        type: "function",
+        function: {
+          name: item.name,
+          arguments: typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments || {}),
+        },
+      });
+    }
+  };
   while (true) {
     const start = remaining.indexOf("<tool_call>");
     if (start === -1) { parts.push(remaining); break; }
     parts.push(remaining.slice(0, start));
     const end = remaining.indexOf("</tool_call>", start + 11);
-    if (end === -1) { parts.push(remaining.slice(start)); break; }
-    const raw = remaining.slice(start + 11, end).trim();
+    const raw = end === -1
+      ? remaining.slice(start + 11).trim()
+      : remaining.slice(start + 11, end).trim();
     const parsed = parsePayload(raw);
     if (parsed) {
-      calls.push({
-        id: "call_" + crypto.randomUUID().replace(/-/g, "").slice(0, 16),
-        type: "function",
-        function: {
-          name: parsed.name || "",
-          arguments: typeof parsed.arguments === "string" ? parsed.arguments : JSON.stringify(parsed.arguments || {}),
-        },
-      });
+      pushParsed(parsed);
     } else {
       parts.push(`<tool_call>${raw}</tool_call>`);
     }
+    if (end === -1) break;
     remaining = remaining.slice(end + 12);
   }
+  if (calls.length === 0) {
+    const stripped = String(text || "")
+      .trim()
+      .replace(/^```(?:json)?\s*/i, "")
+      .replace(/```$/i, "")
+      .trim();
+    const parsed = parsePayload(stripped);
+    if (parsed && normalizedCalls(parsed).length > 0) {
+      pushParsed(parsed);
+      return { textContent: "", toolCalls: calls };
+    }
+  }
   return { textContent: parts.join("").trim(), toolCalls: calls };
+}
+
+function toolName(tool) {
+  return tool?.function?.name || tool?.name || "";
+}
+
+function toolSchema(params, name) {
+  const needle = String(name || "");
+  return (Array.isArray(params?.tools) ? params.tools : [])
+    .map((tool) => tool?.function || tool)
+    .find((tool) => tool?.name === needle) || null;
+}
+
+function parseCallArguments(call) {
+  const raw = call?.function?.arguments ?? "{}";
+  if (typeof raw !== "string") return raw || {};
+  try { return JSON.parse(raw || "{}"); }
+  catch { return null; }
+}
+
+function callSignature(call) {
+  const name = call?.function?.name || "";
+  const args = parseCallArguments(call) || {};
+  if (name === "bash" && typeof args.command === "string") return `${name}:${args.command.trim()}`;
+  return `${name}:${JSON.stringify(args)}`;
+}
+
+function priorToolCallSignatures(messages) {
+  const signatures = new Set();
+  for (const message of messages || []) {
+    if (Array.isArray(message?.tool_calls)) {
+      for (const call of message.tool_calls) signatures.add(callSignature(call));
+    }
+    const content = messageContent(message?.content);
+    if (content && String(content).includes("<tool_call>")) {
+      for (const call of parseToolCalls(content).toolCalls) signatures.add(callSignature(call));
+    }
+  }
+  return signatures;
+}
+
+function finalAdmitsIncomplete(text) {
+  return /(n[aã]o|not|missing|faltam?|incomplet|ainda|still).{0,100}(criad|created|feito|done|conclu|arquivo|file|folder|pasta)|(?:(criad|created|feito|done|conclu|arquivo|file|folder|pasta).{0,100}(n[aã]o|not|missing|faltam?|incomplet|ainda|still))/i.test(String(text || ""));
+}
+
+function riskyBashCommand(command) {
+  const value = String(command || "");
+  const heredocs = value.match(/<<-?\s*['"]?[A-Za-z0-9_]+['"]?/g) || [];
+  return value.length > 8000 || heredocs.length > 1;
+}
+
+function validateToolCall(call, params) {
+  const name = call?.function?.name || "";
+  if (!name) return { ok: false, reason: "missing_tool_name" };
+  const knownNames = new Set((Array.isArray(params?.tools) ? params.tools : []).map(toolName).filter(Boolean));
+  if (knownNames.size > 0 && !knownNames.has(name)) return { ok: false, reason: `unknown_tool:${name}` };
+
+  const args = parseCallArguments(call);
+  if (!args || typeof args !== "object" || Array.isArray(args)) return { ok: false, reason: `invalid_arguments:${name}` };
+
+  const schema = toolSchema(params, name);
+  const required = Array.isArray(schema?.parameters?.required) ? schema.parameters.required : [];
+  for (const field of required) {
+    if (args[field] === undefined || args[field] === null || args[field] === "") {
+      return { ok: false, reason: `missing_argument:${name}.${field}` };
+    }
+  }
+
+  if (name === "bash") {
+    if (typeof args.command !== "string" || !args.command.trim()) return { ok: false, reason: "missing_argument:bash.command" };
+    if (riskyBashCommand(args.command)) return { ok: false, reason: "risky_bash_command" };
+  }
+
+  return { ok: true };
+}
+
+function validateHarnessResult(params, parsed) {
+  const tools = Array.isArray(params?.tools) ? params.tools : [];
+  const messages = Array.isArray(params?.messages) ? params.messages : [];
+  const text = parsed?.textContent?.trim() || "";
+  const calls = Array.isArray(parsed?.toolCalls) ? parsed.toolCalls : [];
+
+  if (tools.length === 0) return text || calls.length > 0 ? { ok: true } : { ok: false, reason: "empty_response" };
+
+  if (hasToolResult(messages)) {
+    const canContinue = canContinueAfterToolResult(params);
+    if (calls.length > 0) {
+      if (!canContinue) return { ok: false, reason: "tool_call_after_result" };
+      const prior = priorToolCallSignatures(messages);
+      for (const call of calls) {
+        const result = validateToolCall(call, params);
+        if (!result.ok) return result;
+        if (prior.has(callSignature(call))) return { ok: false, reason: "repeated_tool_call_after_result" };
+      }
+      return { ok: true };
+    }
+    if (!text) return { ok: false, reason: "empty_final_after_result" };
+    if (canContinue && finalAdmitsIncomplete(text)) return { ok: false, reason: "final_says_incomplete" };
+    return { ok: true };
+  }
+
+  if (toolCallRequired(params) && calls.length === 0) return { ok: false, reason: "missing_tool_call" };
+  for (const call of calls) {
+    const result = validateToolCall(call, params);
+    if (!result.ok) return result;
+  }
+
+  if (!text && calls.length === 0) return { ok: false, reason: "empty_response" };
+  return { ok: true };
+}
+
+function buildHarnessRepairPrompt(params, reason, badText) {
+  const base = buildPrompt(params);
+  const messages = Array.isArray(params?.messages) ? params.messages : [];
+  const bad = String(badText || "").slice(0, 1200);
+  const common = [
+    base,
+    "Harness correction:",
+    `The previous assistant response was rejected by the local harness because: ${reason}.`,
+    bad ? `Rejected response excerpt:\n${bad}` : "",
+  ].filter(Boolean);
+
+  const canContinue = canContinueAfterToolResult(params);
+  if (hasToolResult(messages) && !canContinue) {
+    common.push(
+      "A tool result already exists. Produce final user-facing text only.",
+      "Do not output <tool_call>. Do not call any tool again.",
+      "Use the observed tool result exactly and answer concisely."
+    );
+  } else if (hasToolResult(messages) && canContinue) {
+    common.push(
+      "A tool result already exists for a file/code task.",
+      "If the task is incomplete, produce exactly one next <tool_call>{...}</tool_call> wrapper and no other text.",
+      "If the task is complete, produce final user-facing text only.",
+      "Do not repeat the exact same tool call. Continue with the next small, verifiable step."
+    );
+  } else {
+    common.push(
+      "Produce exactly one valid <tool_call>{...}</tool_call> wrapper and no other text.",
+      "The tool name must exist in Available tools and arguments must match the schema.",
+      "If using bash, use a small verifiable command. Avoid huge heredocs or multiple file writes in one command."
+    );
+  }
+
+  return common.join("\n\n");
+}
+
+async function repairHarnessResponse(params, reason, badText) {
+  try {
+    const repairText = await browserConversation(buildHarnessRepairPrompt(params, reason, badText));
+    const repairParsed = parseToolCalls(repairText);
+    const validation = validateHarnessResult(params, repairParsed);
+    if (validation.ok) {
+      log("harness repair via Node replay:", reason);
+      return { text: repairText, parsed: repairParsed };
+    }
+    log("harness repair rejected:", validation.reason);
+  } catch (err) {
+    log("harness repair failed:", err.message);
+  }
+  return null;
 }
 
 function httpsCall(method, path, headers, body, maxTime = 120000) {
@@ -629,26 +841,34 @@ async function browserConversation(promptText) {
 }
 
 async function conversationWithTools(promptText, params) {
-  const mustCallTool = toolCallRequired(params);
-
   try {
     const nodeText = await browserConversation(promptText);
     const nodeParsed = parseToolCalls(nodeText);
     if (process.env.DEBUG_NODE_TOOLS === "1") {
       log("Node parsed toolCalls:", nodeParsed.toolCalls.length);
     }
-    const usable = nodeText.trim() && (!mustCallTool || nodeParsed.toolCalls.length > 0);
-    if (usable) {
+    const validation = validateHarnessResult(params, nodeParsed);
+    if (validation.ok) {
       log("tools response via Node replay");
       return { text: nodeText, parsed: nodeParsed };
     }
-    log("Node tool replay returned no usable response; falling back to browser");
+    const repaired = await repairHarnessResponse(params, validation.reason, nodeText);
+    if (repaired) return repaired;
+    log("Node tool replay rejected; falling back to browser:", validation.reason);
   } catch (err) {
     log("Node tool replay failed; falling back to browser:", err.message);
   }
 
   const browserText = await browserConversationViaBrowser(promptText);
-  return { text: browserText, parsed: parseToolCalls(browserText) };
+  const browserParsed = parseToolCalls(browserText);
+  const browserValidation = validateHarnessResult(params, browserParsed);
+  if (browserValidation.ok) return { text: browserText, parsed: browserParsed };
+
+  const repaired = await repairHarnessResponse(params, browserValidation.reason, browserText);
+  if (repaired) return repaired;
+
+  log("browser fallback response still rejected:", browserValidation.reason);
+  return { text: browserText, parsed: browserParsed };
 }
 
 async function browserConversationStream(promptText, res) {
