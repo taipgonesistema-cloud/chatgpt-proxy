@@ -115,6 +115,10 @@ function lastUserText(messages) {
   return String(last.content || "");
 }
 
+function hasToolResult(messages) {
+  return (messages || []).some((m) => m?.role === "tool" || m?.role === "toolResult");
+}
+
 function messageContent(content) {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -146,6 +150,14 @@ function explicitlyRequestsTool(text) {
   return /\b(tool|ferramenta|bash|command|comando|run|rodar|execute|executar|pwd|read|ler|list|listar|grep|find|edit|editar|write|escrever)\b/i.test(String(text || ""));
 }
 
+function toolCallRequired(params) {
+  const messages = Array.isArray(params?.messages) ? params.messages : [];
+  return Array.isArray(params?.tools)
+    && params.tools.length > 0
+    && explicitlyRequestsTool(lastUserText(messages))
+    && !hasToolResult(messages);
+}
+
 function buildPrompt(params) {
   const messages = Array.isArray(params.messages) ? params.messages : [];
   const tools = Array.isArray(params.tools) ? params.tools : [];
@@ -171,7 +183,7 @@ function buildPrompt(params) {
     parts.push(`${role}${name}:\n${content}`);
   }
 
-  if (tools.length > 0 && explicitlyRequestsTool(lastUserText(messages))) {
+  if (toolCallRequired(params)) {
     parts.push([
       "Tool-use enforcement:",
       "The latest user explicitly requested a tool/command/file operation.",
@@ -530,6 +542,26 @@ async function browserConversation(promptText) {
   return sse.text;
 }
 
+async function conversationWithTools(promptText, params) {
+  const mustCallTool = toolCallRequired(params);
+
+  try {
+    const nodeText = await browserConversation(promptText);
+    const nodeParsed = parseToolCalls(nodeText);
+    const usable = nodeText.trim() && (!mustCallTool || nodeParsed.toolCalls.length > 0);
+    if (usable) {
+      log("tools response via Node replay");
+      return { text: nodeText, parsed: nodeParsed };
+    }
+    log("Node tool replay returned no usable response; falling back to browser");
+  } catch (err) {
+    log("Node tool replay failed; falling back to browser:", err.message);
+  }
+
+  const browserText = await browserConversationViaBrowser(promptText);
+  return { text: browserText, parsed: parseToolCalls(browserText) };
+}
+
 async function browserConversationStream(promptText, res) {
   const { headers: capturedHeaders, body: newBody } = await captureTokens(promptText);
 
@@ -620,18 +652,21 @@ http.createServer((req, res) => {
           log("Sending via CDP rewrite...");
           if (params.stream) {
             if (Array.isArray(params.tools) && params.tools.length > 0) {
-              const text = await browserConversationViaBrowser(prompt);
-              const parsed = parseToolCalls(text);
+              const { text, parsed } = await conversationWithTools(prompt, params);
               streamCompletion(res, text, parsed);
             } else {
               await browserConversationStream(prompt, res);
             }
             return;
           }
-          const text = Array.isArray(params.tools) && params.tools.length > 0
-            ? await browserConversationViaBrowser(prompt)
-            : await browserConversation(prompt);
-          const parsed = parseToolCalls(text);
+          let text;
+          let parsed;
+          if (Array.isArray(params.tools) && params.tools.length > 0) {
+            ({ text, parsed } = await conversationWithTools(prompt, params));
+          } else {
+            text = await browserConversation(prompt);
+            parsed = parseToolCalls(text);
+          }
           json(res, 200, {
             id: `chatcmpl-${Date.now()}`,
             object: "chat.completion",
