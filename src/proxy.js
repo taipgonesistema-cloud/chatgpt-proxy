@@ -1,4 +1,5 @@
 import http from "node:http";
+import https from "node:https";
 import crypto from "node:crypto";
 import fs from "node:fs";
 
@@ -40,6 +41,13 @@ const PI_TOOL_CONTRACT = [
 
 let requestQueue = Promise.resolve();
 let tabId = null;
+
+const ROOT_PARENT_MESSAGE_ID = "client-created-root";
+const convState = {
+  conversation_id: null,
+  parent_message_id: ROOT_PARENT_MESSAGE_ID,
+  last_assistant_id: null,
+};
 
 function log(...args) { console.log("[chatgpt-proxy]", ...args); }
 
@@ -119,6 +127,25 @@ function messageContent(content) {
   return content == null ? "" : String(content);
 }
 
+function describeTool(tool) {
+  const fn = tool?.function || tool || {};
+  const params = fn.parameters || {};
+  const props = params.properties || {};
+  const required = Array.isArray(params.required) ? params.required : [];
+  const args = Object.entries(props).map(([name, schema]) => {
+    const req = required.includes(name) ? "required" : "optional";
+    const type = schema?.type || "any";
+    const desc = schema?.description ? ` - ${String(schema.description).slice(0, 80)}` : "";
+    return `${name}: ${type} (${req})${desc}`;
+  }).join(", ");
+  const desc = fn.description ? `: ${String(fn.description).slice(0, 160)}` : "";
+  return `- ${fn.name}${desc}\n  arguments: { ${args} }`;
+}
+
+function explicitlyRequestsTool(text) {
+  return /\b(tool|ferramenta|bash|command|comando|run|rodar|execute|executar|pwd|read|ler|list|listar|grep|find|edit|editar|write|escrever)\b/i.test(String(text || ""));
+}
+
 function buildPrompt(params) {
   const messages = Array.isArray(params.messages) ? params.messages : [];
   const tools = Array.isArray(params.tools) ? params.tools : [];
@@ -128,7 +155,7 @@ function buildPrompt(params) {
     parts.push([
       PI_TOOL_CONTRACT,
       "Available tools:",
-      JSON.stringify(tools, null, 2),
+      tools.map(describeTool).join("\n"),
     ].join("\n"));
   }
 
@@ -142,6 +169,16 @@ function buildPrompt(params) {
     const content = messageContent(message?.content);
     if (!content && role !== "tool") continue;
     parts.push(`${role}${name}:\n${content}`);
+  }
+
+  if (tools.length > 0 && explicitlyRequestsTool(lastUserText(messages))) {
+    parts.push([
+      "Tool-use enforcement:",
+      "The latest user explicitly requested a tool/command/file operation.",
+      "Your next response MUST be only one valid <tool_call>{...}</tool_call> wrapper.",
+      "Do not answer from memory. Do not include explanation or final text before the tool result exists.",
+      "For bash/pwd-style requests, call bash with the requested command.",
+    ].join("\n"));
   }
 
   return parts.join("\n\n").trim() || lastUserText(messages);
@@ -176,111 +213,156 @@ function parseToolCalls(text) {
   return { textContent: parts.join("").trim(), toolCalls: calls };
 }
 
-function appendFromEncodedItem(encoded) {
-  let out = "";
-  for (const line of String(encoded || "").split("\n")) {
-    if (!line.startsWith("data: ")) continue;
-    const data = line.slice(6);
-    if (!data || data === "[DONE]" || data.startsWith('"')) continue;
-    try {
-      const obj = JSON.parse(data);
-      if (obj.p === "/message/content/parts/0" && obj.o === "append") out += obj.v || "";
-      if (!obj.p && typeof obj.v === "string") out += obj.v;
-      if (obj.o === "patch" && Array.isArray(obj.v)) {
-        for (const op of obj.v) {
-          if (op.p === "/message/content/parts/0" && op.o === "append") out += op.v || "";
-        }
+function httpsCall(method, path, headers, body, maxTime = 120000) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(`https://chatgpt.com${path}`);
+    if (body && !headers["Content-Type"]) {
+      headers["Content-Type"] = "text/plain;charset=UTF-8";
+    }
+    const opts = { method, hostname: url.hostname, path: url.pathname, headers, timeout: maxTime };
+    const req = https.request(opts, (res) => {
+      let data = "";
+      res.setEncoding("utf8");
+      const contentType = res.headers["content-type"] || "";
+      if (contentType.includes("event-stream")) {
+        let buffer = "";
+        const timer = setTimeout(() => { res.destroy(); }, maxTime);
+        res.on("data", chunk => {
+          buffer += chunk;
+          if (buffer.includes("[DONE]") || buffer.includes("message_stream_complete")) {
+            clearTimeout(timer);
+            res.destroy();
+            resolve({ status: res.statusCode, headers: res.headers, text: buffer });
+          }
+        });
+        res.on("close", () => {
+          clearTimeout(timer);
+          resolve({ status: res.statusCode, headers: res.headers, text: buffer });
+        });
+      } else {
+        const timer = setTimeout(() => { req.destroy(); reject(new Error("Timeout")); }, maxTime);
+        res.on("data", c => { data += c; });
+        res.on("end", () => { clearTimeout(timer); resolve({ status: res.statusCode, headers: res.headers, text: data }); });
       }
-    } catch {}
-  }
-  return out;
-}
-
-function collectEncodedItems(value, out = []) {
-  if (!value || typeof value !== "object") return out;
-  if (typeof value.encoded_item === "string") {
-    out.push({ id: value.stream_item_id || null, encoded: value.encoded_item });
-  }
-  if (Array.isArray(value)) {
-    for (const item of value) collectEncodedItems(item, out);
-  } else {
-    for (const item of Object.values(value)) collectEncodedItems(item, out);
-  }
-  return out;
-}
-
-function parseNetworkText(responses) {
-  let text = "";
-  const seen = new Set();
-  for (const item of responses || []) {
-    if (item.type === "WebSocket" && item.event === "frameReceived" && item.data) {
-      try {
-        const frames = JSON.parse(item.data);
-        for (const encodedItem of collectEncodedItems(frames)) {
-          const key = `${encodedItem.id || ""}:${encodedItem.encoded}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          text += appendFromEncodedItem(encodedItem.encoded);
-        }
-      } catch {}
-      continue;
-    }
-
-    if (isConversationSseBody(item)) {
-      const key = `${item.requestId || item.url}:body:${item.body}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      text += appendFromEncodedItem(item.body);
-    }
-  }
-  return text;
-}
-
-function isConversationSseBody(item) {
-  return item?.type === "Fetch"
-    && String(item.url || "").includes("/backend-api/f/conversation")
-    && !String(item.url || "").includes("/prepare")
-    && typeof item.body === "string"
-    && item.body.length > 0;
-}
-
-function hasCompletionSignal(responses) {
-  return (responses || []).some((item) => {
-    const data = String(item.data || "");
-    const body = String(item.body || "");
-    return data.includes("message_stream_complete")
-      || data.includes("[DONE]")
-      || body.includes("message_stream_complete")
-      || body.includes("data: [DONE]");
+    });
+    req.on("error", reject);
+    if (body) req.write(body);
+    req.end();
   });
 }
 
-function nextNetworkChunks(responses, seen) {
-  const chunks = [];
-  for (const item of responses || []) {
-    if (item.type === "WebSocket" && item.event === "frameReceived" && item.data) {
-      try {
-        const frames = JSON.parse(item.data);
-        for (const encodedItem of collectEncodedItems(frames)) {
-          const key = `${encodedItem.id || ""}:${encodedItem.encoded}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          const text = appendFromEncodedItem(encodedItem.encoded);
-          if (text) chunks.push(text);
-        }
-      } catch {}
-      continue;
-    }
+function hasHeader(headers, name) {
+  const needle = String(name).toLowerCase();
+  return Object.keys(headers || {}).some((key) => key.toLowerCase() === needle);
+}
 
-    if (isConversationSseBody(item)) {
-      const key = `${item.requestId || item.url}:body:${item.body}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      const text = appendFromEncodedItem(item.body);
-      if (text) chunks.push(text);
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function captureTokens(promptText) {
+  const tabId = await getChatGptTabId();
+
+  const startedAt = Date.now();
+  await relay("/rewriteConversationStop").catch(() => {});
+  const rewritePayload = JSON.stringify({ text: promptText, once: true, captureOnly: true });
+  const rewrite = await relay(`/rewriteConversationStart?tabId=${tabId}`, rewritePayload, 10000, "application/json");
+  if (!rewrite.result?.ok) throw new Error(rewrite.result?.error || "rewrite capture start failed");
+
+  const code = `
+(async()=>{
+  const ta = document.getElementById('prompt-textarea');
+  if(!ta) throw new Error('noprompt');
+  ta.focus(); ta.textContent='';
+  document.execCommand('insertText', false, '.');
+  ta.dispatchEvent(new Event('input', {bubbles:true}));
+  await new Promise(r=>setTimeout(r,300));
+  const btn = document.querySelector('#composer-submit-button,[data-testid="send-button"]');
+  if(!btn) throw new Error('nobutton');
+  btn.click();
+})()`;
+  relay(`/evalAsync?tabId=${tabId}&timeout=30000`, code, 35000).catch(() => {});
+
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    await sleep(250);
+    const status = await relay("/rewriteConversationStatus", null, 5000).catch(() => null);
+    const history = status?.result?.history || [];
+    const hit = [...history].reverse().find((item) =>
+      item.captureOnly === true
+      && item.timestamp >= startedAt
+      && item.requestHeaders
+      && item.rewrittenPostData
+      && !item.rewriteError
+    );
+    if (!hit) continue;
+
+    const capturedHeaders = hit.requestHeaders || {};
+    if (!hasHeader(capturedHeaders, "authorization")) continue;
+
+    log("tokens captured:",
+      Object.keys(capturedHeaders).filter(k =>
+        k.includes("sentinel") || k.includes("token") || k === "authorization"
+      ).join(", ")
+    );
+    return { headers: capturedHeaders, body: hit.rewrittenPostData };
+  }
+
+  await relay("/rewriteConversationStop").catch(() => {});
+  throw new Error("Token capture timed out");
+}
+
+async function triggerComposerPlaceholder(tabId) {
+  const code = `
+(async()=>{
+  const ta = document.getElementById('prompt-textarea');
+  if(!ta) throw new Error('noprompt');
+  ta.focus(); ta.textContent='';
+  document.execCommand('insertText', false, '.');
+  ta.dispatchEvent(new Event('input', {bubbles:true}));
+  await new Promise(r=>setTimeout(r,300));
+  const btn = document.querySelector('#composer-submit-button,[data-testid="send-button"]');
+  if(!btn) throw new Error('nobutton');
+  btn.click();
+})()`;
+  await relay(`/evalAsync?tabId=${tabId}&timeout=30000`, code, 35000);
+}
+
+async function browserConversationViaBrowser(promptText) {
+  const tabId = await getChatGptTabId();
+  await relay(`/networkStart?tabId=${tabId}&filter=/backend-api/f/conversation`, null, 10000);
+
+  const rewritePayload = JSON.stringify({ text: promptText, once: true, captureOnly: false });
+  const rewrite = await relay(`/rewriteConversationStart?tabId=${tabId}`, rewritePayload, 10000, "application/json");
+  if (!rewrite.result?.ok) throw new Error(rewrite.result?.error || "rewrite start failed");
+
+  await triggerComposerPlaceholder(tabId);
+
+  const deadline = Date.now() + 120000;
+  let latestBody = "";
+  while (Date.now() < deadline) {
+    await sleep(500);
+    const net = await relay("/networkResponses", null, 10000).catch(() => null);
+    const responses = net?.result?.responses || [];
+    const conv = [...responses].reverse().find((item) =>
+      item.type === "Fetch"
+      && String(item.url || "").includes("/backend-api/f/conversation")
+      && !String(item.url || "").includes("/prepare")
+      && typeof item.body === "string"
+      && item.body.length > 0
+    );
+    if (conv?.body) latestBody = conv.body;
+    if (latestBody.includes("message_stream_complete") || latestBody.includes("data: [DONE]")) {
+      const sse = parseSSE(latestBody);
+      if (sse.conversation_id) convState.conversation_id = sse.conversation_id;
+      if (sse.assistant_id) {
+        convState.parent_message_id = sse.assistant_id;
+        convState.last_assistant_id = sse.assistant_id;
+      }
+      return sse.text;
     }
   }
-  return chunks;
+  throw new Error(latestBody ? `Timed out after partial browser response: ${latestBody.slice(0, 500)}` : "Timed out waiting for browser response");
 }
 
 function streamJson(res, data) {
@@ -385,76 +467,135 @@ function writeStreamDone(res, streamState, finishReason = "stop") {
   res.end();
 }
 
-async function triggerComposerSend() {
-  const code = `
-(async () => {
-  const input = document.getElementById('prompt-textarea');
-  if (!input) return JSON.stringify({ok:false,error:'no prompt-textarea'});
-  input.focus();
-  input.textContent = '';
-  document.execCommand('insertText', false, '.');
-  input.dispatchEvent(new Event('input', {bubbles:true}));
-  await new Promise(r => setTimeout(r, 250));
-  const button = document.querySelector('#composer-submit-button,[data-testid="send-button"]');
-  if (!button) return JSON.stringify({ok:false,error:'no send button'});
-  button.click();
-  return JSON.stringify({ok:true});
-})()`;
-  const raw = await evalInTab(code, 20000);
-  const result = JSON.parse(raw);
-  if (!result.ok) throw new Error(result.error || "send trigger failed");
+function parseSSE(text) {
+  const textparts = [];
+  let convId = null;
+  let assistantId = null;
+  let lastP = "";
+  let lastO = "";
+  for (const line of (text || "").split("\n")) {
+    if (!line.startsWith("data: ")) continue;
+    const p = line.slice(6);
+    if (p === "[DONE]") continue;
+    try {
+      const obj = JSON.parse(p);
+      if (obj.type === "resume_conversation_token" && obj.conversation_id) {
+        convId = obj.conversation_id;
+      }
+      const curP = obj.p !== undefined ? obj.p : lastP;
+      const curO = obj.o !== undefined ? obj.o : lastO;
+      lastP = curP;
+      lastO = curO;
+      if (curP === "/message/content/parts/0" && curO === "append") {
+        textparts.push(obj.v || "");
+      }
+      if (curO === "patch" && Array.isArray(obj.v)) {
+        for (const op of obj.v) {
+          if (op.p === "/message/content/parts/0" && op.o === "append") {
+            textparts.push(op.v || "");
+          }
+        }
+      }
+      if (obj.v?.message?.author?.role === "assistant" && obj.v?.message?.id) {
+        if (!assistantId) assistantId = obj.v.message.id;
+      }
+    } catch {}
+  }
+  return { text: textparts.join(""), conversation_id: convId, assistant_id: assistantId };
 }
 
 async function browserConversation(promptText) {
-  const id = await getChatGptTabId();
-  await relay(`/networkStart?tabId=${id}&filter=/backend-api/f/conversation`, null, 10000);
+  const { headers: capturedHeaders, body: newBody } = await captureTokens(promptText);
 
-  const rewritePayload = JSON.stringify({ text: promptText, once: true });
-  const rewrite = await relay(`/rewriteConversationStart?tabId=${id}`, rewritePayload, 10000, "application/json");
-  if (!rewrite.result?.ok) throw new Error(rewrite.result?.error || "rewrite start failed");
+  const headers = { ...capturedHeaders };
+  const blocked = new Set(["content-length", "host", "connection",
+    "accept-encoding", "transfer-encoding"]);
+  for (const h of blocked) delete headers[h];
+  if (!hasHeader(headers, "accept")) headers["accept"] = "text/event-stream";
 
-  await triggerComposerSend();
+  const result = await httpsCall("POST", "/backend-api/f/conversation", headers, newBody);
 
-  const deadline = Date.now() + 120000;
-  let latestText = "";
-  while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 1000));
-    const net = await relay("/networkResponses", null, 10000);
-    const responses = net.result?.responses || [];
-    latestText = parseNetworkText(responses) || latestText;
-    const complete = hasCompletionSignal(responses);
-    if (complete && latestText) return latestText;
+  if (result.status !== 200) {
+    throw new Error(`ChatGPT ${result.status}: ${result.text.slice(0, 500)}`);
   }
-  throw new Error(latestText ? `Timed out after partial response: ${latestText}` : "Timed out waiting for ChatGPT response");
+
+  const sse = parseSSE(result.text);
+
+  if (sse.conversation_id) convState.conversation_id = sse.conversation_id;
+  if (sse.assistant_id) {
+    convState.parent_message_id = sse.assistant_id;
+    convState.last_assistant_id = sse.assistant_id;
+  }
+
+  return sse.text;
 }
 
 async function browserConversationStream(promptText, res) {
+  const { headers: capturedHeaders, body: newBody } = await captureTokens(promptText);
+
+  const headers = { ...capturedHeaders };
+  const blocked = new Set(["content-length", "host", "connection",
+    "accept-encoding", "transfer-encoding"]);
+  for (const h of blocked) delete headers[h];
+  if (!hasHeader(headers, "accept")) headers["accept"] = "text/event-stream";
+
   const streamState = writeStreamStart(res);
-  const id = await getChatGptTabId();
-  await relay(`/networkStart?tabId=${id}&filter=/backend-api/f/conversation`, null, 10000);
 
-  const rewritePayload = JSON.stringify({ text: promptText, once: true });
-  const rewrite = await relay(`/rewriteConversationStart?tabId=${id}`, rewritePayload, 10000, "application/json");
-  if (!rewrite.result?.ok) throw new Error(rewrite.result?.error || "rewrite start failed");
+  const url = new URL("https://chatgpt.com/backend-api/f/conversation");
+  const opts = { method: "POST", hostname: url.hostname, path: url.pathname, headers, timeout: 120000 };
 
-  await triggerComposerSend();
+  await new Promise((resolve, reject) => {
+    const req = https.request(opts, (chatRes) => {
+      chatRes.setEncoding("utf8");
+      let lastP = "", lastO = "", roleSent = false;
 
-  const seen = new Set();
-  const deadline = Date.now() + 120000;
-  while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 300));
-    const net = await relay("/networkResponses", null, 10000);
-    const responses = net.result?.responses || [];
-    for (const chunk of nextNetworkChunks(responses, seen)) {
-      writeStreamContent(res, streamState, chunk);
-    }
-    const complete = hasCompletionSignal(responses);
-    if (complete) {
-      writeStreamDone(res, streamState);
-      return;
-    }
-  }
-  writeStreamDone(res, streamState, "stop");
+      chatRes.on("data", (chunk) => {
+        for (const line of chunk.split("\n")) {
+          if (!line.startsWith("data: ")) continue;
+          const payload = line.slice(6);
+          if (payload === "[DONE]") continue;
+          try {
+            const obj = JSON.parse(payload);
+            if (typeof obj !== "object") continue;
+
+            if (obj.type === "resume_conversation_token" && obj.conversation_id) {
+              convState.conversation_id = obj.conversation_id;
+            }
+            if (obj.v?.message?.author?.role === "assistant" && obj.v?.message?.id) {
+              convState.parent_message_id = obj.v.message.id;
+              convState.last_assistant_id = obj.v.message.id;
+            }
+
+            const curP = obj.p !== undefined ? obj.p : lastP;
+            const curO = obj.o !== undefined ? obj.o : lastO;
+            lastP = curP; lastO = curO;
+
+            if (curP === "/message/content/parts/0" && curO === "append") {
+              const t = obj.v || "";
+              if (t) writeStreamContent(res, streamState, t);
+            }
+            if (curO === "patch" && Array.isArray(obj.v)) {
+              for (const op of obj.v) {
+                if (op.p === "/message/content/parts/0" && op.o === "append") {
+                  const t = op.v || "";
+                  if (t) writeStreamContent(res, streamState, t);
+                }
+              }
+            }
+          } catch {}
+        }
+      });
+      chatRes.on("end", () => {
+        writeStreamDone(res, streamState);
+        resolve();
+      });
+      chatRes.on("error", reject);
+    });
+    req.on("error", reject);
+    req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
+    req.write(newBody);
+    req.end();
+  });
 }
 
 http.createServer((req, res) => {
@@ -479,7 +620,7 @@ http.createServer((req, res) => {
           log("Sending via CDP rewrite...");
           if (params.stream) {
             if (Array.isArray(params.tools) && params.tools.length > 0) {
-              const text = await browserConversation(prompt);
+              const text = await browserConversationViaBrowser(prompt);
               const parsed = parseToolCalls(text);
               streamCompletion(res, text, parsed);
             } else {
@@ -487,7 +628,9 @@ http.createServer((req, res) => {
             }
             return;
           }
-          const text = await browserConversation(prompt);
+          const text = Array.isArray(params.tools) && params.tools.length > 0
+            ? await browserConversationViaBrowser(prompt)
+            : await browserConversation(prompt);
           const parsed = parseToolCalls(text);
           json(res, 200, {
             id: `chatcmpl-${Date.now()}`,
