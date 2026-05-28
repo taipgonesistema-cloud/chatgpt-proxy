@@ -27,6 +27,7 @@ const PI_TOOL_CONTRACT = [
   "You are running inside Pi Coding Agent through an OpenAI-compatible proxy.",
   "Pi can execute tools for you, but only if your response is valid structured tool-call text.",
   "When a tool is needed, output only tool calls and nothing else.",
+  "Do not answer the result of a command or file operation yourself; that result only exists after Pi executes the tool.",
   "Use exactly this form, with valid JSON inside:",
   '<tool_call>{"name":"tool_name","arguments":{"arg":"value"}}</tool_call>',
   "Never put tool calls in Markdown code fences.",
@@ -150,6 +151,23 @@ function explicitlyRequestsTool(text) {
   return /\b(tool|ferramenta|bash|command|comando|run|rodar|execute|executar|pwd|read|ler|list|listar|grep|find|edit|editar|write|escrever)\b/i.test(String(text || ""));
 }
 
+function requestedBashCommand(text) {
+  const value = String(text || "").trim();
+  if (!/\bbash\b|\b(command|comando|run|rodar|execute|executar)\b/i.test(value)) return "";
+  const patterns = [
+    /\b(?:bash\s+)?(?:para\s+)?(?:rodar|executar|execute|run)\s*:\s*(.+?)(?:\s+e\s+(?:responda|retorne|me diga)|\s+and\s+(?:respond|return|tell)|$)/i,
+    /\b(?:bash\s+)?(?:para\s+)?(?:rodar|executar|execute|run)\s+`([^`]+)`/i,
+    /\b(?:bash\s+)?(?:para\s+)?(?:rodar|executar|execute|run)\s+"([^"]+)"/i,
+    /\b(?:bash\s+)?(?:para\s+)?(?:rodar|executar|execute|run)\s+(.+?)(?:\s+e\s+(?:responda|retorne|me diga)|\s+and\s+(?:respond|return|tell)|$)/i,
+  ];
+  for (const pattern of patterns) {
+    const match = value.match(pattern);
+    const command = match?.[1]?.trim().replace(/[.!?]+$/, "");
+    if (command) return command;
+  }
+  return "";
+}
+
 function toolCallRequired(params) {
   const messages = Array.isArray(params?.messages) ? params.messages : [];
   return Array.isArray(params?.tools)
@@ -183,14 +201,25 @@ function buildPrompt(params) {
     parts.push(`${role}${name}:\n${content}`);
   }
 
+  if (tools.length > 0 && hasToolResult(messages)) {
+    parts.push([
+      "Tool result handling:",
+      "A tool result is already present in the conversation.",
+      "Use that observed result to answer the user now.",
+      "Do not call the same tool again unless the result is missing, failed, or explicitly insufficient.",
+    ].join("\n"));
+  }
+
   if (toolCallRequired(params)) {
+    const bashCommand = requestedBashCommand(lastUserText(messages));
     parts.push([
       "Tool-use enforcement:",
       "The latest user explicitly requested a tool/command/file operation.",
       "Your next response MUST be only one valid <tool_call>{...}</tool_call> wrapper.",
-      "Do not answer from memory. Do not include explanation or final text before the tool result exists.",
+      "Do not answer from memory or infer command output. Do not include explanation or final text before the tool result exists.",
       "For bash/pwd-style requests, call bash with the requested command.",
-    ].join("\n"));
+      bashCommand ? `Detected bash command hint: ${bashCommand}` : "",
+    ].filter(Boolean).join("\n"));
   }
 
   return parts.join("\n\n").trim() || lastUserText(messages);
@@ -200,6 +229,16 @@ function parseToolCalls(text) {
   const calls = [];
   let remaining = text || "";
   const parts = [];
+  const parsePayload = (raw) => {
+    const attempts = [raw, raw.replace(/>\s*$/, "")];
+    const lastBrace = raw.lastIndexOf("}");
+    if (lastBrace !== -1) attempts.push(raw.slice(0, lastBrace + 1));
+    for (const attempt of attempts) {
+      try { return JSON.parse(attempt); }
+      catch {}
+    }
+    return null;
+  };
   while (true) {
     const start = remaining.indexOf("<tool_call>");
     if (start === -1) { parts.push(remaining); break; }
@@ -207,8 +246,8 @@ function parseToolCalls(text) {
     const end = remaining.indexOf("</tool_call>", start + 11);
     if (end === -1) { parts.push(remaining.slice(start)); break; }
     const raw = remaining.slice(start + 11, end).trim();
-    try {
-      const parsed = JSON.parse(raw);
+    const parsed = parsePayload(raw);
+    if (parsed) {
       calls.push({
         id: "call_" + crypto.randomUUID().replace(/-/g, "").slice(0, 16),
         type: "function",
@@ -217,7 +256,7 @@ function parseToolCalls(text) {
           arguments: typeof parsed.arguments === "string" ? parsed.arguments : JSON.stringify(parsed.arguments || {}),
         },
       });
-    } catch {
+    } else {
       parts.push(`<tool_call>${raw}</tool_call>`);
     }
     remaining = remaining.slice(end + 12);
@@ -238,18 +277,36 @@ function httpsCall(method, path, headers, body, maxTime = 120000) {
       const contentType = res.headers["content-type"] || "";
       if (contentType.includes("event-stream")) {
         let buffer = "";
-        const timer = setTimeout(() => { res.destroy(); }, maxTime);
+        let settled = false;
+        let emptyCompleteTimer = null;
+        const finish = (destroy = true) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (emptyCompleteTimer) clearTimeout(emptyCompleteTimer);
+          if (destroy) res.destroy();
+          resolve({ status: res.statusCode, headers: res.headers, text: buffer });
+        };
+        const timer = setTimeout(() => finish(true), maxTime);
         res.on("data", chunk => {
           buffer += chunk;
-          if (buffer.includes("[DONE]") || buffer.includes("message_stream_complete")) {
-            clearTimeout(timer);
-            res.destroy();
-            resolve({ status: res.statusCode, headers: res.headers, text: buffer });
+          if (buffer.includes("data: [DONE]")) {
+            finish(true);
+            return;
+          }
+          if (buffer.includes("message_stream_complete")) {
+            const summary = summarizeSSE(buffer);
+            if (summary.contentAppends > 0) {
+              finish(true);
+              return;
+            }
+            if (!emptyCompleteTimer) {
+              emptyCompleteTimer = setTimeout(() => finish(true), 5000);
+            }
           }
         });
         res.on("close", () => {
-          clearTimeout(timer);
-          resolve({ status: res.statusCode, headers: res.headers, text: buffer });
+          finish(false);
         });
       } else {
         const timer = setTimeout(() => { req.destroy(); reject(new Error("Timeout")); }, maxTime);
@@ -479,6 +536,31 @@ function writeStreamDone(res, streamState, finishReason = "stop") {
   res.end();
 }
 
+function summarizeSSE(text) {
+  const summary = { dataLines: 0, jsonLines: 0, types: {}, paths: {}, contentAppends: 0, thinkingMentions: 0 };
+  for (const line of (text || "").split("\n")) {
+    if (!line.startsWith("data: ")) continue;
+    summary.dataLines++;
+    const payload = line.slice(6);
+    if (payload === "[DONE]") continue;
+    if (payload.toLowerCase().includes("thinking")) summary.thinkingMentions++;
+    try {
+      const obj = JSON.parse(payload);
+      summary.jsonLines++;
+      if (obj.type) summary.types[obj.type] = (summary.types[obj.type] || 0) + 1;
+      if (obj.p) summary.paths[obj.p] = (summary.paths[obj.p] || 0) + 1;
+      if (obj.p === "/message/content/parts/0" && obj.o === "append") summary.contentAppends++;
+      if (obj.o === "patch" && Array.isArray(obj.v)) {
+        for (const op of obj.v) {
+          if (op.p) summary.paths[op.p] = (summary.paths[op.p] || 0) + 1;
+          if (op.p === "/message/content/parts/0" && op.o === "append") summary.contentAppends++;
+        }
+      }
+    } catch {}
+  }
+  return summary;
+}
+
 function parseSSE(text) {
   const textparts = [];
   let convId = null;
@@ -532,6 +614,10 @@ async function browserConversation(promptText) {
   }
 
   const sse = parseSSE(result.text);
+  if (process.env.DEBUG_NODE_TOOLS === "1") {
+    log("Node SSE summary:", JSON.stringify(summarizeSSE(result.text)));
+    log("Node parsed text:", JSON.stringify(sse.text.slice(0, 300)));
+  }
 
   if (sse.conversation_id) convState.conversation_id = sse.conversation_id;
   if (sse.assistant_id) {
@@ -548,6 +634,9 @@ async function conversationWithTools(promptText, params) {
   try {
     const nodeText = await browserConversation(promptText);
     const nodeParsed = parseToolCalls(nodeText);
+    if (process.env.DEBUG_NODE_TOOLS === "1") {
+      log("Node parsed toolCalls:", nodeParsed.toolCalls.length);
+    }
     const usable = nodeText.trim() && (!mustCallTool || nodeParsed.toolCalls.length > 0);
     if (usable) {
       log("tools response via Node replay");
